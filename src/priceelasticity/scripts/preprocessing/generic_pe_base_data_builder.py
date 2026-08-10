@@ -1,6 +1,5 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 import pandas as pd
 import re
@@ -12,6 +11,7 @@ import sys
 # ============================================================
 
 spark = SparkSession.builder.getOrCreate()
+
 
 def get_param(param_name: str, default_value: str = "") -> str:
     arg_key = f"--{param_name}"
@@ -31,27 +31,26 @@ def get_param(param_name: str, default_value: str = "") -> str:
         return dbutils.widgets.get(param_name).strip()
     except Exception:
         return default_value
+
+
 # ============================================================
-# 2. Notebook parameters
+# 2. Notebook / job parameters
 # ============================================================
-# In Databricks, you will set these values from widgets.
-# You do NOT need to change code every time.
-#
-# Minimum required business fields:
-#   product/article column
-#   store/location column
-#   date or week column
-#   quantity/sales column
-#   price column
-#
-# If your column names are common, auto-detect will work.
-# If not, pass the column names through widgets.
 
 INPUT_PATH = get_param("input_path", "")
 INPUT_FORMAT = get_param("input_format", "csv")
 EXCEL_SHEET = get_param("excel_sheet", "")
 OUTPUT_SCHEMA = get_param("output_schema", "workspace.default")
 TABLE_PREFIX = get_param("table_prefix", "")
+if not TABLE_PREFIX:
+    raise ValueError(
+        "table_prefix is required. "
+        "Use a unique run-specific value like pe_run_12345."
+    )
+# NEW:
+# If input is CSV / Excel / Parquet, this will automatically create
+# a raw Delta table before creating the final PE base table.
+RAW_DELTA_MODE = get_param("create_raw_delta", "auto").strip().lower()
 
 MANUAL_MAP = {
     "product": get_param("product_col", ""),
@@ -72,9 +71,11 @@ MANUAL_MAP = {
 }
 
 if TABLE_PREFIX:
+    OUTPUT_RAW_DELTA_TABLE = f"{OUTPUT_SCHEMA}.{TABLE_PREFIX}_raw_delta"
     OUTPUT_BASE_TABLE = f"{OUTPUT_SCHEMA}.{TABLE_PREFIX}_base_data_table"
     OUTPUT_QUALITY_TABLE = f"{OUTPUT_SCHEMA}.{TABLE_PREFIX}_base_data_quality_summary"
 else:
+    OUTPUT_RAW_DELTA_TABLE = f"{OUTPUT_SCHEMA}.raw_delta"
     OUTPUT_BASE_TABLE = f"{OUTPUT_SCHEMA}.base_data_table"
     OUTPUT_QUALITY_TABLE = f"{OUTPUT_SCHEMA}.base_data_quality_summary"
 
@@ -85,6 +86,7 @@ else:
 
 COLUMN_CANDIDATES = {
     "product": [
+        "product",
         "pe_article",
         "group_article_id",
         "group_article",
@@ -113,10 +115,11 @@ COLUMN_CANDIDATES = {
         "sales_date",
         "transaction_date",
         "invoice_date",
+        "business_date",
+        "order_date",
         "snapshot_date",
         "value_date",
         "posting_date",
-        "week_start_date",
     ],
     "week": [
         "wm_yr_wk",
@@ -212,6 +215,7 @@ COLUMN_CANDIDATES = {
     "inventory": [
         "pe_inventory_onhand_quantity",
         "inventory",
+        "inventory_quantity",
         "inventory_qty",
         "onhandstockqty",
         "on_hand_stock_quantity",
@@ -280,7 +284,7 @@ def find_column(df, role: str, required: bool = False):
     if required:
         raise ValueError(
             f"Missing required column for role '{role}'. "
-            f"Pass it using widget '{role}_col'. "
+            f"Pass it using widget/parameter '{role}_col'. "
             f"Available columns: {df.columns}"
         )
 
@@ -299,11 +303,63 @@ def safe_col(df, col_name, alias_name, cast_type=None, default_value=None):
     return expr.alias(alias_name)
 
 
-def load_input_dataset():
-    if not INPUT_PATH:
-        raise ValueError("input_path is empty. Set the dataset path first.")
+def find_wide_daily_sales_columns(df):
+    """
+    Finds wide daily quantity columns.
 
+    Supports columns like:
+        2016-06-17
+        2016_06_17
+
+    After normalization, 2016-06-17 usually becomes 2016_06_17.
+    """
+    daily_cols = []
+
+    for col_name in df.columns:
+        if re.fullmatch(r"\d{4}_\d{2}_\d{2}", col_name):
+            daily_cols.append((col_name, col_name.replace("_", "-")))
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", col_name):
+            daily_cols.append((col_name, col_name))
+
+    return daily_cols
+
+
+def load_input_dataset():
+    """
+    Generic input reader.
+
+    It can read:
+        csv
+        excel / xlsx
+        parquet
+        delta
+
+    New behavior:
+        If input is CSV / Excel / Parquet and create_raw_delta = yes,
+        this function automatically creates:
+
+            <output_schema>.<table_prefix>_raw_delta
+
+        Then it reads back from that Delta table and returns the DataFrame.
+    """
+
+    if not INPUT_PATH:
+        raise ValueError("input_path is empty. Set the dataset path/table first.")
     fmt = INPUT_FORMAT.lower().strip()
+
+    if RAW_DELTA_MODE == "auto":
+        should_create_raw_delta = fmt in ["csv", "excel", "xlsx", "parquet"]
+    else:
+        should_create_raw_delta = RAW_DELTA_MODE in ["yes", "true", "1", "y"]
+
+    print("==================================================")
+    print("Loading input dataset")
+    print("Input path:", INPUT_PATH)
+    print("Input format:", fmt)
+    print("Raw Delta mode:", RAW_DELTA_MODE)
+    print("Should create raw Delta:", should_create_raw_delta)
+    print("Raw Delta output table:", OUTPUT_RAW_DELTA_TABLE)
+    print("==================================================")
 
     if fmt == "csv":
         df = (
@@ -317,13 +373,18 @@ def load_input_dataset():
         df = spark.read.parquet(INPUT_PATH)
 
     elif fmt == "delta":
-        # INPUT_PATH can be either a path or a table name.
-        if INPUT_PATH.startswith("dbfs:/") or INPUT_PATH.startswith("/") or INPUT_PATH.startswith("s3:/") or INPUT_PATH.startswith("abfss:/"):
+        # INPUT_PATH can be either a Delta path or a table name.
+        if (
+            INPUT_PATH.startswith("dbfs:/")
+            or INPUT_PATH.startswith("/")
+            or INPUT_PATH.startswith("s3:/")
+            or INPUT_PATH.startswith("abfss:/")
+        ):
             df = spark.read.format("delta").load(INPUT_PATH)
         else:
             df = spark.table(INPUT_PATH)
 
-    elif fmt == "excel":
+    elif fmt in ["excel", "xlsx"]:
         local_path = dbfs_to_local_path(INPUT_PATH)
 
         if EXCEL_SHEET.strip():
@@ -338,68 +399,102 @@ def load_input_dataset():
 
     df = normalize_dataframe_columns(df)
 
-    print("Input rows:", df.count())
+    input_rows = df.count()
+    input_columns = len(df.columns)
+
+    print("Input rows:", input_rows)
+    print("Input column count:", input_columns)
     print("Input columns:", df.columns)
+
+    if input_rows == 0:
+        raise ValueError("Uploaded dataset has zero rows. Stopping pipeline.")
+
+    # Automatically create raw Delta table only if input is not already Delta.
+    if fmt != "delta" and should_create_raw_delta:
+        print("==================================================")
+        print("Creating raw Delta table automatically")
+        print("Raw Delta table:", OUTPUT_RAW_DELTA_TABLE)
+        print("==================================================")
+
+        spark.sql(f"DROP TABLE IF EXISTS {OUTPUT_RAW_DELTA_TABLE}")
+
+        (
+            df.write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(OUTPUT_RAW_DELTA_TABLE)
+        )
+
+        print("Raw Delta table created successfully:", OUTPUT_RAW_DELTA_TABLE)
+
+        # Read back from Delta so remaining pipeline uses the Delta table.
+        df = spark.table(OUTPUT_RAW_DELTA_TABLE)
+
+        print("Read back raw Delta table successfully.")
+
+    elif fmt == "delta":
+        print("Input is already Delta. Skipping raw Delta creation.")
+
+    else:
+        print("Raw Delta creation not required. Skipping raw Delta creation.")
 
     return df
 
 
-def add_week_fields(df, date_col, week_col):
-    if date_col:
-        df = df.withColumn("_raw_date", F.to_date(F.col(date_col)))
-    else:
-        df = df.withColumn("_raw_date", F.lit(None).cast("date"))
+def add_daily_calendar_fields(df):
+    """
+    Adds daily calendar fields.
 
-    if week_col and week_col in df.columns and week_col != date_col:
-        # If week column is numeric like 202605, use it.
-        # If it is a date, convert to year*100 + weekofyear.
-        df = df.withColumn(
-            "_raw_week_string",
-            F.col(week_col).cast("string")
-        )
+    Final grain must be:
+        product + store + date
 
-        df = df.withColumn(
-            "_week_as_date",
-            F.to_date(F.col(week_col))
-        )
+    wm_yr_wk is kept only as a helper column for reporting/MDO constraints.
+    """
+    df = df.withColumn("date", F.to_date(F.col("date")))
 
-        df = df.withColumn(
-            "_wm_yr_wk_from_week",
-            F.when(
-                F.col("_raw_week_string").rlike(r"^[0-9]{5,6}$"),
-                F.col(week_col).cast("int")
-            ).when(
-                F.col("_week_as_date").isNotNull(),
-                (F.year(F.col("_week_as_date")) * F.lit(100)) + F.weekofyear(F.col("_week_as_date"))
-            ).otherwise(F.lit(None).cast("int"))
-        )
-    else:
-        df = df.withColumn("_wm_yr_wk_from_week", F.lit(None).cast("int"))
-        df = df.withColumn("_week_as_date", F.lit(None).cast("date"))
+    df = df.withColumn(
+        "_input_week_string",
+        F.col("input_week_value").cast("string")
+    )
+
+    df = df.withColumn(
+        "_input_week_as_date",
+        F.to_date(F.col("input_week_value"))
+    )
+
+    df = df.withColumn(
+        "_input_wm_yr_wk",
+        F.when(
+            F.col("_input_week_string").rlike(r"^[0-9]{5,6}$"),
+            F.col("_input_week_string").cast("int")
+        ).when(
+            F.col("_input_week_as_date").isNotNull(),
+            (F.year(F.col("_input_week_as_date")) * F.lit(100)) + F.weekofyear(F.col("_input_week_as_date"))
+        ).otherwise(F.lit(None).cast("int"))
+    )
 
     df = df.withColumn(
         "week_start_date",
         F.coalesce(
-            F.col("_week_as_date"),
-            F.to_date(F.date_trunc("week", F.col("_raw_date")))
-        )
-    )
-
-    df = df.withColumn(
-        "date",
-        F.coalesce(
-            F.col("_raw_date"),
-            F.date_add(F.col("week_start_date"), 6)
+            F.col("_input_week_as_date"),
+            F.to_date(F.date_trunc("week", F.col("date")))
         )
     )
 
     df = df.withColumn(
         "wm_yr_wk",
         F.coalesce(
-            F.col("_wm_yr_wk_from_week"),
+            F.col("_input_wm_yr_wk"),
             (F.year(F.col("week_start_date")) * F.lit(100)) + F.weekofyear(F.col("week_start_date"))
         ).cast("int")
     )
+
+    df = df.withColumn("calendar_month", F.month(F.col("date")))
+    df = df.withColumn("calendar_year", F.year(F.col("date")))
+    df = df.withColumn("calendar_day_id", F.date_format(F.col("date"), "yyyy-MM-dd"))
+    df = df.withColumn("weekday", F.date_format(F.col("date"), "EEEE"))
+    df = df.withColumn("wday", F.dayofweek(F.col("date")).cast("int"))
 
     return df
 
@@ -410,16 +505,29 @@ def add_week_fields(df, date_col, week_col):
 
 def create_generic_base_data_table():
     print("==================================================")
-    print("Running generic dataset to PE/MDO base table")
+    print("Running generic dataset to DAILY PE/MDO base table")
+    print("Target grain: product-store-day")
     print("==================================================")
 
     raw_df = load_input_dataset()
 
     product_col = find_column(raw_df, "product", required=True)
     store_col = find_column(raw_df, "store", required=True)
+
     date_col = find_column(raw_df, "date", required=False)
     week_col = find_column(raw_df, "week", required=False)
-    quantity_col = find_column(raw_df, "quantity", required=True)
+
+    wide_daily_cols = find_wide_daily_sales_columns(raw_df)
+
+    # For wide daily files, daily date columns are the quantity columns.
+    # For flat daily files, we need a normal date column and quantity column.
+    if wide_daily_cols:
+        quantity_col = find_column(raw_df, "quantity", required=False)
+        input_mode = "wide_daily"
+    else:
+        quantity_col = find_column(raw_df, "quantity", required=True)
+        input_mode = "flat_daily"
+
     price_col = find_column(raw_df, "price", required=True)
 
     base_price_col = find_column(raw_df, "base_price", required=False)
@@ -434,17 +542,20 @@ def create_generic_base_data_table():
     stock_col = find_column(raw_df, "stock", required=False)
     inventory_col = find_column(raw_df, "inventory", required=False)
 
-    if not date_col and not week_col:
+    if input_mode == "flat_daily" and not date_col:
         raise ValueError(
-            "Dataset must contain either date column or week column. "
-            "Set date_col or week_col widget."
+            "Daily base data requires a real date column. "
+            "Only week-level data cannot create true daily predictions. "
+            "Pass date_col or provide wide daily date columns like 2016-06-17."
         )
 
+    print("Detected input mode:", input_mode)
     print("Detected/mapped columns:")
     print("product:", product_col)
     print("store:", store_col)
     print("date:", date_col)
     print("week:", week_col)
+    print("wide_daily_columns:", len(wide_daily_cols))
     print("quantity:", quantity_col)
     print("price:", price_col)
     print("base_price:", base_price_col)
@@ -457,51 +568,102 @@ def create_generic_base_data_table():
     print("stock:", stock_col)
     print("inventory:", inventory_col)
 
-    df = add_week_fields(raw_df, date_col=date_col, week_col=week_col)
+    if input_mode == "wide_daily":
+        stack_expression = "stack({0}, {1}) as (date, raw_quantity)".format(
+            len(wide_daily_cols),
+            ", ".join(
+                [
+                    f"'{date_literal}', `{source_col}`"
+                    for source_col, date_literal in wide_daily_cols
+                ]
+            )
+        )
+
+        standard_df = (
+            raw_df
+            .select(
+                F.col(product_col).cast("string").alias("pe_article"),
+                F.col(store_col).cast("string").alias("pe_store_group"),
+
+                safe_col(raw_df, week_col, "input_week_value", "string"),
+
+                F.col(price_col).cast("double").alias("raw_unit_price"),
+
+                safe_col(raw_df, base_price_col, "raw_base_price", "double"),
+                safe_col(raw_df, discount_col, "raw_discount", "double"),
+
+                safe_col(raw_df, country_col, "pe_country", "string", "UNKNOWN"),
+                safe_col(raw_df, category_col, "pe_category", "string", "UNKNOWN"),
+                safe_col(raw_df, product_type_col, "pe_product_type", "string", "UNKNOWN"),
+                safe_col(raw_df, product_division_col, "pe_product_division", "string", "UNKNOWN"),
+                safe_col(raw_df, gender_col, "pe_gender", "string", "UNKNOWN"),
+
+                safe_col(raw_df, stock_col, "raw_stock_quantity", "double"),
+                safe_col(raw_df, inventory_col, "raw_inventory_quantity", "double"),
+
+                F.expr(stack_expression)
+            )
+            .withColumn("date", F.to_date(F.col("date")))
+            .withColumn(
+                "raw_quantity",
+                F.coalesce(F.col("raw_quantity").cast("double"), F.lit(0.0))
+            )
+        )
+
+    else:
+        standard_df = (
+            raw_df
+            .select(
+                F.col(product_col).cast("string").alias("pe_article"),
+                F.col(store_col).cast("string").alias("pe_store_group"),
+
+                F.to_date(F.col(date_col)).alias("date"),
+                safe_col(raw_df, week_col, "input_week_value", "string"),
+
+                F.col(quantity_col).cast("double").alias("raw_quantity"),
+                F.col(price_col).cast("double").alias("raw_unit_price"),
+
+                safe_col(raw_df, base_price_col, "raw_base_price", "double"),
+                safe_col(raw_df, discount_col, "raw_discount", "double"),
+
+                safe_col(raw_df, country_col, "pe_country", "string", "UNKNOWN"),
+                safe_col(raw_df, category_col, "pe_category", "string", "UNKNOWN"),
+                safe_col(raw_df, product_type_col, "pe_product_type", "string", "UNKNOWN"),
+                safe_col(raw_df, product_division_col, "pe_product_division", "string", "UNKNOWN"),
+                safe_col(raw_df, gender_col, "pe_gender", "string", "UNKNOWN"),
+
+                safe_col(raw_df, stock_col, "raw_stock_quantity", "double"),
+                safe_col(raw_df, inventory_col, "raw_inventory_quantity", "double"),
+            )
+        )
 
     standard_df = (
-        df
-        .select(
-            F.col(product_col).cast("string").alias("pe_article"),
-            F.col(store_col).cast("string").alias("pe_store_group"),
-
-            F.col("date").alias("date"),
-            F.col("week_start_date").alias("week_start_date"),
-            F.col("wm_yr_wk").alias("wm_yr_wk"),
-
-            F.col(quantity_col).cast("double").alias("raw_quantity"),
-            F.col(price_col).cast("double").alias("raw_unit_price"),
-
-            safe_col(df, base_price_col, "raw_base_price", "double"),
-            safe_col(df, discount_col, "raw_discount", "double"),
-
-            safe_col(df, country_col, "pe_country", "string", "UNKNOWN"),
-            safe_col(df, category_col, "pe_category", "string", "UNKNOWN"),
-            safe_col(df, product_type_col, "pe_product_type", "string", "UNKNOWN"),
-            safe_col(df, product_division_col, "pe_product_division", "string", "UNKNOWN"),
-            safe_col(df, gender_col, "pe_gender", "string", "UNKNOWN"),
-
-            safe_col(df, stock_col, "raw_stock_quantity", "double"),
-            safe_col(df, inventory_col, "raw_inventory_quantity", "double"),
-        )
+        standard_df
         .filter(F.col("pe_article").isNotNull())
         .filter(F.col("pe_store_group").isNotNull())
         .filter(F.col("date").isNotNull())
-        .filter(F.col("wm_yr_wk").isNotNull())
         .filter(F.col("raw_quantity").isNotNull())
     )
 
-    # Aggregate to product-store-week grain.
+    standard_df = add_daily_calendar_fields(standard_df)
+
+    # Aggregate duplicate rows only to product-store-date grain.
+    # This is daily aggregation, not weekly aggregation.
     base_df = (
         standard_df
         .groupBy(
             "pe_article",
             "pe_store_group",
-            "wm_yr_wk"
+            "date"
         )
         .agg(
-            F.min("week_start_date").alias("week_start_date"),
-            F.max("date").alias("date"),
+            F.first("week_start_date", ignorenulls=True).alias("week_start_date"),
+            F.first("wm_yr_wk", ignorenulls=True).alias("wm_yr_wk"),
+            F.first("calendar_month", ignorenulls=True).alias("calendar_month"),
+            F.first("calendar_year", ignorenulls=True).alias("calendar_year"),
+            F.first("calendar_day_id", ignorenulls=True).alias("calendar_day_id"),
+            F.first("weekday", ignorenulls=True).alias("weekday"),
+            F.first("wday", ignorenulls=True).alias("wday"),
 
             F.sum(F.coalesce(F.col("raw_quantity"), F.lit(0.0))).alias("pe_quantity"),
 
@@ -517,18 +679,16 @@ def create_generic_base_data_table():
             F.first("pe_product_type", ignorenulls=True).alias("pe_product_type"),
             F.first("pe_product_division", ignorenulls=True).alias("pe_product_division"),
             F.first("pe_gender", ignorenulls=True).alias("pe_gender"),
-
-            F.count("*").alias("days_in_week"),
-            F.sum(
-                F.when(F.col("raw_quantity") > 0, F.lit(1)).otherwise(F.lit(0))
-            ).alias("days_sold_count"),
         )
     )
 
     base_df = (
         base_df
-        .withColumn("calendar_month", F.month(F.col("date")))
-        .withColumn("calendar_year", F.year(F.col("date")))
+        .withColumn("days_in_week", F.lit(1))
+        .withColumn(
+            "days_sold_count",
+            F.when(F.col("pe_quantity") > 0, F.lit(1)).otherwise(F.lit(0))
+        )
 
         .withColumn(
             "pe_unit_price",
@@ -664,13 +824,13 @@ def create_generic_base_data_table():
                     "||",
                     F.col("pe_article"),
                     F.col("pe_store_group"),
-                    F.col("wm_yr_wk").cast("string")
+                    F.col("date").cast("string")
                 ),
                 256
             )
         )
 
-        .withColumn("base_data_grain", F.lit("product_store_week"))
+        .withColumn("base_data_grain", F.lit("product_store_day"))
 
         .withColumn(
             "pe_store_state",
@@ -686,10 +846,20 @@ def create_generic_base_data_table():
             F.when(F.col("valid_price_flag") == 1, F.lit("MAPPED"))
              .otherwise(F.lit("MISSING_OR_INVALID"))
         )
-        .withColumn("price_start_date", F.col("week_start_date"))
+
+        # In generic data, price is assumed valid for that daily row.
+        .withColumn("price_start_date", F.col("date"))
         .withColumn("price_end_date", F.col("date"))
 
-        # Optional calendar/event fields expected by feature code.
+        # Generic stock/inventory are treated as daily values if provided.
+        .withColumn("stock_date", F.col("date"))
+        .withColumn("stock_start_date", F.col("date"))
+        .withColumn("stock_end_date", F.col("date"))
+        .withColumn("inventory_date", F.col("date"))
+        .withColumn("inventory_start_date", F.col("date"))
+        .withColumn("inventory_end_date", F.col("date"))
+
+        # Optional calendar/event fields expected by downstream feature code.
         .withColumn("event_name_1", F.lit(None).cast("string"))
         .withColumn("event_type_1", F.lit(None).cast("string"))
         .withColumn("event_name_2", F.lit(None).cast("string"))
@@ -709,6 +879,9 @@ def create_generic_base_data_table():
         "wm_yr_wk",
         "calendar_month",
         "calendar_year",
+        "calendar_day_id",
+        "weekday",
+        "wday",
 
         "pe_article",
         "pe_store_group",
@@ -736,6 +909,12 @@ def create_generic_base_data_table():
         "pe_inventory_onhand_quantity_for_model",
         "stock_available_flag",
         "inventory_available_flag",
+        "stock_date",
+        "stock_start_date",
+        "stock_end_date",
+        "inventory_date",
+        "inventory_start_date",
+        "inventory_end_date",
 
         "is_sold",
         "probability_target",
@@ -774,7 +953,7 @@ def create_generic_base_data_table():
         .filter(F.col("pe_store_group").isNotNull())
         .filter(F.col("pe_quantity").isNotNull())
         .filter(F.col("pe_quantity") >= 0)
-        .dropDuplicates(["pe_article", "pe_store_group", "wm_yr_wk"])
+        .dropDuplicates(["pe_article", "pe_store_group", "date"])
     )
 
     print("Dropping old output tables if present.")
@@ -797,6 +976,7 @@ def create_generic_base_data_table():
         .agg(
             F.count("*").alias("rows"),
             F.countDistinct("pe_article").alias("products"),
+            F.countDistinct("date").alias("days"),
             F.countDistinct("wm_yr_wk").alias("weeks"),
             F.countDistinct("pe_article_store_group").alias("product_store_groups"),
 
@@ -830,10 +1010,12 @@ def create_generic_base_data_table():
     display(
         spark.sql(f"""
             SELECT
+                base_data_grain,
                 COUNT(*) AS rows,
                 COUNT(DISTINCT pe_article) AS products,
                 COUNT(DISTINCT pe_store_group) AS stores,
                 COUNT(DISTINCT pe_article_store_group) AS product_store_groups,
+                COUNT(DISTINCT date) AS days,
                 COUNT(DISTINCT wm_yr_wk) AS weeks,
                 MIN(date) AS min_date,
                 MAX(date) AS max_date,
@@ -841,10 +1023,29 @@ def create_generic_base_data_table():
                 SUM(valid_for_price_elasticity) AS rows_valid_for_price_elasticity,
                 SUM(valid_for_mdo_input) AS rows_valid_for_mdo_input
             FROM {OUTPUT_BASE_TABLE}
+            GROUP BY base_data_grain
         """)
     )
 
-    print("Validation 2: price and discount variation")
+    print("Validation 2: duplicate product-store-date check")
+    display(
+        spark.sql(f"""
+            SELECT
+                COUNT(*) AS duplicate_keys
+            FROM (
+                SELECT
+                    pe_article,
+                    pe_store_group,
+                    date,
+                    COUNT(*) AS rows_per_key
+                FROM {OUTPUT_BASE_TABLE}
+                GROUP BY pe_article, pe_store_group, date
+                HAVING COUNT(*) > 1
+            )
+        """)
+    )
+
+    print("Validation 3: price and discount variation")
     display(
         spark.sql(f"""
             SELECT
@@ -861,7 +1062,7 @@ def create_generic_base_data_table():
         """)
     )
 
-    print("Validation 3: quality by store")
+    print("Validation 4: quality by store")
     display(
         spark.sql(f"""
             SELECT *
@@ -870,13 +1071,15 @@ def create_generic_base_data_table():
         """)
     )
 
-    print("Validation 4: sample rows")
+    print("Validation 5: sample rows")
     display(
         spark.sql(f"""
             SELECT
                 date,
                 week_start_date,
                 wm_yr_wk,
+                weekday,
+                wday,
                 pe_article,
                 pe_store_group,
                 pe_quantity,
@@ -891,13 +1094,14 @@ def create_generic_base_data_table():
                 pe_product_type,
                 pe_product_division
             FROM {OUTPUT_BASE_TABLE}
-            ORDER BY pe_store_group, pe_article, wm_yr_wk
+            ORDER BY pe_store_group, pe_article, date
             LIMIT 100
         """)
     )
 
     print("==================================================")
-    print("Generic PE/MDO base table completed successfully")
+    print("Generic DAILY PE/MDO base table completed successfully")
+    print("Raw Delta:", OUTPUT_RAW_DELTA_TABLE)
     print("Output:", OUTPUT_BASE_TABLE)
     print("Quality:", OUTPUT_QUALITY_TABLE)
     print("==================================================")

@@ -12,20 +12,60 @@ spark = SparkSession.builder.getOrCreate()
 
 
 # ============================================================
-# 2. Config
+# 2. Config - generic table naming
 # ============================================================
 
-SOURCE_BASE_TABLE = "workspace.default.base_data_table"
+def get_param(param_name: str, default_value: str = "") -> str:
+    arg_key = f"--{param_name}"
 
-OUTPUT_FEATURE_TABLE = "workspace.default.pe_causal_features_dev"
-OUTPUT_FEATURE_VIEW = "pe_causal_features_dev_view"
+    if arg_key in sys.argv:
+        arg_index = sys.argv.index(arg_key)
+        if arg_index + 1 < len(sys.argv):
+            return sys.argv[arg_index + 1].strip()
 
-OUTPUT_FEATURE_QUALITY_TABLE = "workspace.default.pe_causal_features_quality_summary"
+    for arg in sys.argv:
+        arg = str(arg).strip()
+        if arg.startswith(arg_key + "="):
+            return arg.split("=", 1)[1].strip()
 
-MIN_HISTORY_POINTS_FOR_CAUSAL = 4
+    try:
+        dbutils.widgets.text(param_name, default_value)
+        return dbutils.widgets.get(param_name).strip()
+    except Exception:
+        return default_value
 
-# This is used to convert probability 0/1 into logit safely.
-# 0 becomes 0.01, 1 becomes 0.99.
+
+OUTPUT_SCHEMA = get_param("output_schema", "workspace.default")
+TABLE_PREFIX = get_param("table_prefix", "")
+
+
+def table_name(base_name: str) -> str:
+    if TABLE_PREFIX:
+        return f"{OUTPUT_SCHEMA}.{TABLE_PREFIX}_{base_name}"
+    return f"{OUTPUT_SCHEMA}.{base_name}"
+
+
+def view_name(base_name: str) -> str:
+    if TABLE_PREFIX:
+        return f"{TABLE_PREFIX}_{base_name}"
+    return base_name
+
+
+SOURCE_BASE_TABLE = table_name("base_data_table")
+
+OUTPUT_FEATURE_TABLE = table_name("pe_causal_features_dev")
+OUTPUT_FEATURE_VIEW = view_name("pe_causal_features_dev_view")
+
+OUTPUT_FEATURE_QUALITY_TABLE = table_name("pe_causal_features_quality_summary")
+
+
+# Daily version:
+# Old weekly code used MIN_HISTORY_POINTS_FOR_CAUSAL = 4 weeks.
+# 4 weeks is roughly 28 days.
+MIN_HISTORY_POINTS_FOR_CAUSAL_DAYS = int(
+    get_param("min_history_points_for_causal_days", "28")
+)
+
 PROBABILITY_EPSILON = 0.01
 
 
@@ -120,6 +160,21 @@ def load_base_table():
         "base_data_table",
     )
 
+    if "base_data_grain" in base_df.columns:
+        grains = [
+            row["base_data_grain"]
+            for row in base_df.select("base_data_grain").distinct().collect()
+        ]
+
+        print("Base data grain values:", grains)
+
+        if "product_store_day" not in grains:
+            raise ValueError(
+                "This daily feature engineering file expects base_data_grain = product_store_day. "
+                f"Found grains: {grains}. "
+                "Run the modified daily base data builder first."
+            )
+
     return base_df
 
 
@@ -129,13 +184,13 @@ def load_base_table():
 
 def prepare_standard_feature_base(base_df):
     """
-    Convert base_data_table into a clean product-store-week feature table.
+    Convert base_data_table into a clean product-store-day feature table.
 
-    This keeps all rows, including rows where some price/stock/inventory values
-    may be missing. Later model steps use quality flags to filter valid rows.
+    Grain:
+        pe_article + pe_store_group + date
     """
 
-    print("Preparing standard PE feature base...")
+    print("Preparing standard DAILY PE feature base...")
 
     feature_base_df = (
         base_df
@@ -143,16 +198,20 @@ def prepare_standard_feature_base(base_df):
             F.to_date(F.col("date")).alias("date"),
             safe_select_col(base_df, "week_start_date", "week_start_date"),
             F.col("wm_yr_wk").cast("int").alias("wm_yr_wk"),
+
             safe_select_col(base_df, "calendar_month", "calendar_month", "int"),
             safe_select_col(base_df, "calendar_year", "calendar_year", "int"),
+            safe_select_col(base_df, "calendar_day_id", "calendar_day_id"),
+            safe_select_col(base_df, "weekday", "weekday"),
+            safe_select_col(base_df, "wday", "wday", "int"),
 
             F.col("pe_article").alias("pe_article"),
             F.col("pe_store_group").alias("pe_store_group"),
             safe_select_col(base_df, "pe_article_store_group", "pe_article_store_group"),
 
             F.col("pe_quantity").cast("double").alias("pe_quantity"),
-            safe_select_col(base_df, "days_in_week", "days_in_week", "int"),
-            safe_select_col(base_df, "days_sold_count", "days_sold_count", "int"),
+            safe_select_col(base_df, "days_in_week", "days_in_week", "int", 1),
+            safe_select_col(base_df, "days_sold_count", "days_sold_count", "int", 0),
 
             safe_select_col(base_df, "pe_unit_price", "pe_unit_price", "double"),
             safe_select_col(base_df, "pe_actual_retail_price", "pe_actual_retail_price", "double"),
@@ -164,6 +223,13 @@ def prepare_standard_feature_base(base_df):
             safe_select_col(base_df, "pe_inventory_onhand_quantity", "pe_inventory_onhand_quantity", "double"),
             safe_select_col(base_df, "pe_store_stock_quantity_for_model", "pe_store_stock_quantity_for_model", "double", 0.0),
             safe_select_col(base_df, "pe_inventory_onhand_quantity_for_model", "pe_inventory_onhand_quantity_for_model", "double", 0.0),
+
+            safe_select_col(base_df, "stock_date", "stock_date"),
+            safe_select_col(base_df, "stock_start_date", "stock_start_date"),
+            safe_select_col(base_df, "stock_end_date", "stock_end_date"),
+            safe_select_col(base_df, "inventory_date", "inventory_date"),
+            safe_select_col(base_df, "inventory_start_date", "inventory_start_date"),
+            safe_select_col(base_df, "inventory_end_date", "inventory_end_date"),
 
             F.col("is_sold").cast("double").alias("is_sold"),
             F.col("probability_target").cast("double").alias("probability_target"),
@@ -218,7 +284,18 @@ def prepare_standard_feature_base(base_df):
         )
     )
 
-    print("Standard feature base rows:", feature_base_df.count())
+    feature_base_df = (
+        feature_base_df
+        .withColumn(
+            "day_of_week",
+            F.coalesce(F.col("wday").cast("int"), F.dayofweek(F.col("date")))
+        )
+        .withColumn("day_of_month", F.dayofmonth(F.col("date")))
+        .withColumn("week_of_year", F.weekofyear(F.col("date")))
+        .withColumn("is_weekend", F.when(F.col("day_of_week").isin(1, 7), F.lit(1)).otherwise(F.lit(0)))
+    )
+
+    print("Standard DAILY feature base rows:", feature_base_df.count())
 
     return feature_base_df
 
@@ -286,9 +363,6 @@ def add_core_model_features(feature_df):
         .withColumn("probability_target", F.col("is_sold").cast("double"))
     )
 
-    # Important change:
-    # Probability causal/mixed-linear model should not train directly on raw 0/1.
-    # So we create smoothed probability and logit target.
     feature_df = (
         feature_df
         .withColumn(
@@ -308,26 +382,10 @@ def add_core_model_features(feature_df):
 
     feature_df = (
         feature_df
-        .withColumn(
-            "discount_power_1",
-            F.when(F.col("discount").isNotNull(), F.col("discount"))
-             .otherwise(F.lit(None).cast("double"))
-        )
-        .withColumn(
-            "discount_power_2",
-            F.when(F.col("discount").isNotNull(), F.pow(F.col("discount"), 2))
-             .otherwise(F.lit(None).cast("double"))
-        )
-        .withColumn(
-            "discount_power_3",
-            F.when(F.col("discount").isNotNull(), F.pow(F.col("discount"), 3))
-             .otherwise(F.lit(None).cast("double"))
-        )
-        .withColumn(
-            "discount_power_4",
-            F.when(F.col("discount").isNotNull(), F.pow(F.col("discount"), 4))
-             .otherwise(F.lit(None).cast("double"))
-        )
+        .withColumn("discount_power_1", F.col("discount").cast("double"))
+        .withColumn("discount_power_2", F.when(F.col("discount").isNotNull(), F.pow(F.col("discount"), 2)))
+        .withColumn("discount_power_3", F.when(F.col("discount").isNotNull(), F.pow(F.col("discount"), 3)))
+        .withColumn("discount_power_4", F.when(F.col("discount").isNotNull(), F.pow(F.col("discount"), 4)))
     )
 
     return feature_df
@@ -338,125 +396,130 @@ def add_core_model_features(feature_df):
 # ============================================================
 
 def add_cce_features(feature_df):
-    """
-    Add CCE columns.
+    print("Adding DAILY CCE features...")
 
-    CCE = Common Correlated Effects.
+    day_window = Window.partitionBy("date")
 
-    These columns summarize common demand and price movement by week,
-    store-week, category-week, product-type-week, division-week, and country-week.
-    The causal model later uses these for orthogonalization.
-    """
+    feature_df = (
+        feature_df
+        .withColumn("cce_day_avg_log_quantity", F.avg("log_quantity").over(day_window))
+        .withColumn("cce_day_avg_log_price", F.avg("log_price").over(day_window))
+    )
 
-    print("Adding CCE features...")
+    store_day_window = Window.partitionBy("pe_store_group", "date")
+
+    feature_df = (
+        feature_df
+        .withColumn("cce_store_day_avg_log_quantity", F.avg("log_quantity").over(store_day_window))
+        .withColumn("cce_store_day_avg_log_price", F.avg("log_price").over(store_day_window))
+    )
+
+    if "pe_category" in feature_df.columns:
+        category_day_window = Window.partitionBy("pe_category", "date")
+        feature_df = (
+            feature_df
+            .withColumn("cce_category_day_avg_log_quantity", F.avg("log_quantity").over(category_day_window))
+            .withColumn("cce_category_day_avg_log_price", F.avg("log_price").over(category_day_window))
+        )
+
+    if "pe_product_type" in feature_df.columns:
+        product_type_day_window = Window.partitionBy("pe_product_type", "date")
+        feature_df = (
+            feature_df
+            .withColumn("cce_product_type_day_avg_log_quantity", F.avg("log_quantity").over(product_type_day_window))
+            .withColumn("cce_product_type_day_avg_log_price", F.avg("log_price").over(product_type_day_window))
+        )
+
+    if "pe_product_division" in feature_df.columns:
+        division_day_window = Window.partitionBy("pe_product_division", "date")
+        feature_df = (
+            feature_df
+            .withColumn("cce_product_division_day_avg_log_quantity", F.avg("log_quantity").over(division_day_window))
+            .withColumn("cce_product_division_day_avg_log_price", F.avg("log_price").over(division_day_window))
+        )
+
+    if "pe_country" in feature_df.columns:
+        country_day_window = Window.partitionBy("pe_country", "date")
+        feature_df = (
+            feature_df
+            .withColumn("cce_country_day_avg_log_quantity", F.avg("log_quantity").over(country_day_window))
+            .withColumn("cce_country_day_avg_log_price", F.avg("log_price").over(country_day_window))
+        )
 
     week_window = Window.partitionBy("wm_yr_wk")
 
     feature_df = (
         feature_df
-        .withColumn(
-            "cce_week_avg_log_quantity",
-            F.avg("log_quantity").over(week_window)
-        )
-        .withColumn(
-            "cce_week_avg_log_price",
-            F.avg("log_price").over(week_window)
-        )
+        .withColumn("cce_week_avg_log_quantity", F.avg("log_quantity").over(week_window))
+        .withColumn("cce_week_avg_log_price", F.avg("log_price").over(week_window))
     )
 
     store_week_window = Window.partitionBy("pe_store_group", "wm_yr_wk")
 
     feature_df = (
         feature_df
-        .withColumn(
-            "cce_store_week_avg_log_quantity",
-            F.avg("log_quantity").over(store_week_window)
-        )
-        .withColumn(
-            "cce_store_week_avg_log_price",
-            F.avg("log_price").over(store_week_window)
-        )
+        .withColumn("cce_store_week_avg_log_quantity", F.avg("log_quantity").over(store_week_window))
+        .withColumn("cce_store_week_avg_log_price", F.avg("log_price").over(store_week_window))
     )
 
     if "pe_category" in feature_df.columns:
         category_week_window = Window.partitionBy("pe_category", "wm_yr_wk")
-
         feature_df = (
             feature_df
-            .withColumn(
-                "cce_category_week_avg_log_quantity",
-                F.avg("log_quantity").over(category_week_window)
-            )
-            .withColumn(
-                "cce_category_week_avg_log_price",
-                F.avg("log_price").over(category_week_window)
-            )
+            .withColumn("cce_category_week_avg_log_quantity", F.avg("log_quantity").over(category_week_window))
+            .withColumn("cce_category_week_avg_log_price", F.avg("log_price").over(category_week_window))
         )
 
     if "pe_product_type" in feature_df.columns:
         product_type_week_window = Window.partitionBy("pe_product_type", "wm_yr_wk")
-
         feature_df = (
             feature_df
-            .withColumn(
-                "cce_product_type_week_avg_log_quantity",
-                F.avg("log_quantity").over(product_type_week_window)
-            )
-            .withColumn(
-                "cce_product_type_week_avg_log_price",
-                F.avg("log_price").over(product_type_week_window)
-            )
+            .withColumn("cce_product_type_week_avg_log_quantity", F.avg("log_quantity").over(product_type_week_window))
+            .withColumn("cce_product_type_week_avg_log_price", F.avg("log_price").over(product_type_week_window))
         )
 
     if "pe_product_division" in feature_df.columns:
         division_week_window = Window.partitionBy("pe_product_division", "wm_yr_wk")
-
         feature_df = (
             feature_df
-            .withColumn(
-                "cce_product_division_week_avg_log_quantity",
-                F.avg("log_quantity").over(division_week_window)
-            )
-            .withColumn(
-                "cce_product_division_week_avg_log_price",
-                F.avg("log_price").over(division_week_window)
-            )
+            .withColumn("cce_product_division_week_avg_log_quantity", F.avg("log_quantity").over(division_week_window))
+            .withColumn("cce_product_division_week_avg_log_price", F.avg("log_price").over(division_week_window))
         )
 
     if "pe_country" in feature_df.columns:
         country_week_window = Window.partitionBy("pe_country", "wm_yr_wk")
-
         feature_df = (
             feature_df
-            .withColumn(
-                "cce_country_week_avg_log_quantity",
-                F.avg("log_quantity").over(country_week_window)
-            )
-            .withColumn(
-                "cce_country_week_avg_log_price",
-                F.avg("log_price").over(country_week_window)
-            )
+            .withColumn("cce_country_week_avg_log_quantity", F.avg("log_quantity").over(country_week_window))
+            .withColumn("cce_country_week_avg_log_price", F.avg("log_price").over(country_week_window))
         )
 
     return feature_df
 
 
 # ============================================================
-# 8. Add training-readiness flags
+# 8. Add training-readiness flags + Phase 2 MDO support columns
 # ============================================================
 
 def add_training_readiness_flags(feature_df):
     """
     Add row-level flags for causal, sales, probability, and MDO usage.
+
+    Phase 2 additions:
+    - history_days
+    - price_variation
+    - discount_variation
+    - prediction_confidence
     """
 
-    print("Adding training-readiness flags...")
+    print("Adding DAILY training-readiness flags and Phase 2 MDO support columns...")
 
     group_stats_df = (
         feature_df
         .groupBy("pe_article_store_group")
         .agg(
             F.count("*").alias("rows_per_product_store"),
+            F.countDistinct("date").alias("days_per_product_store"),
             F.countDistinct("wm_yr_wk").alias("weeks_per_product_store"),
             F.countDistinct(
                 F.when(F.col("valid_price_flag") == 1, F.col("pe_unit_price"))
@@ -464,6 +527,18 @@ def add_training_readiness_flags(feature_df):
             F.countDistinct(
                 F.when(F.col("valid_price_flag") == 1, F.col("discount"))
             ).alias("discount_variation_count"),
+
+            # Rule 31 - Price Variation Rule:
+            # Calculate price standard deviation so MDO can detect low price movement.
+            F.stddev(
+                F.when(F.col("valid_price_flag") == 1, F.col("pe_unit_price"))
+            ).alias("price_variation"),
+
+            # Rule 32 - Discount Variation Rule:
+            # Calculate discount standard deviation so MDO can detect low discount movement.
+            F.stddev(
+                F.when(F.col("valid_price_flag") == 1, F.col("discount"))
+            ).alias("discount_variation"),
         )
     )
 
@@ -475,6 +550,36 @@ def add_training_readiness_flags(feature_df):
 
     feature_df = (
         feature_df
+
+        # Rule 30 - Minimum History Rule:
+        # Use number of available product-store days as history_days for Phase 2 MDO rule.
+        .withColumn(
+            "history_days",
+            F.coalesce(F.col("days_per_product_store").cast("double"), F.lit(0.0))
+        )
+
+        # Rule 31 - Price Variation Rule:
+        # Use price standard deviation; if null, set 0 so low-variation rows can be detected.
+        .withColumn(
+            "price_variation",
+            F.coalesce(F.col("price_variation").cast("double"), F.lit(0.0))
+        )
+
+        # Rule 32 - Discount Variation Rule:
+        # Use discount standard deviation; if null, set 0 so low-variation rows can be detected.
+        .withColumn(
+            "discount_variation",
+            F.coalesce(F.col("discount_variation").cast("double"), F.lit(0.0))
+        )
+
+        # Rule 33 - Low Confidence Prediction Rule:
+        # Feature engineering does not produce model confidence yet, so set null.
+        # MDO will apply this rule only when prediction_confidence is available from model output.
+        .withColumn(
+            "prediction_confidence",
+            F.lit(None).cast("double")
+        )
+
         .withColumn(
             "valid_for_sales_training",
             F.when(
@@ -514,7 +619,7 @@ def add_training_readiness_flags(feature_df):
                 (F.col("sold_qty_log").isNotNull()) &
                 (F.col("log_price").isNotNull()) &
                 (F.col("discount").isNotNull()) &
-                (F.col("weeks_per_product_store") >= F.lit(MIN_HISTORY_POINTS_FOR_CAUSAL)) &
+                (F.col("days_per_product_store") >= F.lit(MIN_HISTORY_POINTS_FOR_CAUSAL_DAYS)) &
                 (
                     (F.col("price_variation_count") > 1) |
                     (F.col("discount_variation_count") > 1)
@@ -538,6 +643,7 @@ def create_feature_quality_summary(feature_df):
         .agg(
             F.count("*").alias("rows"),
             F.countDistinct("pe_article").alias("products"),
+            F.countDistinct("date").alias("days"),
             F.countDistinct("wm_yr_wk").alias("weeks"),
             F.countDistinct("pe_article_store_group").alias("product_store_groups"),
 
@@ -552,26 +658,18 @@ def create_feature_quality_summary(feature_df):
             F.min("date").alias("min_date"),
             F.max("date").alias("max_date"),
 
+            F.avg("history_days").alias("avg_history_days"),
+            F.avg("price_variation").alias("avg_price_variation"),
+            F.avg("discount_variation").alias("avg_discount_variation"),
+
             F.avg("probability_target").alias("avg_probability_target"),
             F.avg("probability_target_smoothed").alias("avg_probability_target_smoothed"),
             F.avg("probability_logit_target").alias("avg_probability_logit_target"),
         )
-        .withColumn(
-            "causal_training_pct",
-            F.col("rows_valid_for_causal_training") / F.col("rows")
-        )
-        .withColumn(
-            "sales_training_pct",
-            F.col("rows_valid_for_sales_training") / F.col("rows")
-        )
-        .withColumn(
-            "probability_training_with_price_pct",
-            F.col("rows_valid_for_probability_training_with_price") / F.col("rows")
-        )
-        .withColumn(
-            "mdo_ready_pct",
-            F.col("rows_valid_for_mdo_input") / F.col("rows")
-        )
+        .withColumn("causal_training_pct", F.col("rows_valid_for_causal_training") / F.col("rows"))
+        .withColumn("sales_training_pct", F.col("rows_valid_for_sales_training") / F.col("rows"))
+        .withColumn("probability_training_with_price_pct", F.col("rows_valid_for_probability_training_with_price") / F.col("rows"))
+        .withColumn("mdo_ready_pct", F.col("rows_valid_for_mdo_input") / F.col("rows"))
     )
 
     return quality_df
@@ -583,29 +681,11 @@ def create_feature_quality_summary(feature_df):
 
 def run_causal_feature_engineering():
     print("==============================================")
-    print("Running PE Feature Engineering")
+    print("Running DAILY PE Feature Engineering")
     print("==============================================")
-
-    try:
-        user_email = (
-            dbutils.notebook.entry_point
-            .getDbutils()
-            .notebook()
-            .getContext()
-            .userName()
-            .get()
-        )
-
-        project_root = f"/Workspace/Users/{user_email}/PE_work"
-
-        if project_root not in sys.path:
-            sys.path.append(project_root)
-
-        print("Project root added:", project_root)
-
-    except Exception as exc:
-        print("Could not auto-detect project root.")
-        print("Error:", exc)
+    print("Source base table:", SOURCE_BASE_TABLE)
+    print("Output feature table:", OUTPUT_FEATURE_TABLE)
+    print("Minimum daily history for causal:", MIN_HISTORY_POINTS_FOR_CAUSAL_DAYS)
 
     base_df = load_base_table()
 
@@ -643,136 +723,26 @@ def run_causal_feature_engineering():
     print("Permanent feature table saved:", OUTPUT_FEATURE_TABLE)
     print("Feature quality table saved:", OUTPUT_FEATURE_QUALITY_TABLE)
 
-    print("Validation 1: feature table size")
+    print("Validation: Phase 2 MDO support columns")
     display(
         spark.sql(f"""
             SELECT
                 COUNT(*) AS rows,
-                COUNT(DISTINCT pe_article) AS products,
-                COUNT(DISTINCT pe_store_group) AS stores,
-                COUNT(DISTINCT pe_article_store_group) AS product_store_groups,
-                COUNT(DISTINCT wm_yr_wk) AS weeks,
-                MIN(date) AS min_date,
-                MAX(date) AS max_date
+                MIN(history_days) AS min_history_days,
+                MAX(history_days) AS max_history_days,
+                AVG(history_days) AS avg_history_days,
+                MIN(price_variation) AS min_price_variation,
+                MAX(price_variation) AS max_price_variation,
+                AVG(price_variation) AS avg_price_variation,
+                MIN(discount_variation) AS min_discount_variation,
+                MAX(discount_variation) AS max_discount_variation,
+                AVG(discount_variation) AS avg_discount_variation
             FROM {OUTPUT_FEATURE_TABLE}
-        """)
-    )
-
-    print("Validation 2: feature quality by store")
-    display(
-        spark.sql(f"""
-            SELECT *
-            FROM {OUTPUT_FEATURE_QUALITY_TABLE}
-            ORDER BY pe_store_group
-        """)
-    )
-
-    print("Validation 3: causal training readiness")
-    display(
-        spark.sql(f"""
-            SELECT
-                valid_price_flag,
-                valid_for_price_elasticity,
-                valid_for_causal_training,
-                COUNT(*) AS rows
-            FROM {OUTPUT_FEATURE_TABLE}
-            GROUP BY
-                valid_price_flag,
-                valid_for_price_elasticity,
-                valid_for_causal_training
-            ORDER BY
-                valid_price_flag,
-                valid_for_price_elasticity,
-                valid_for_causal_training
-        """)
-    )
-
-    print("Validation 4: probability logit target check")
-    display(
-        spark.sql(f"""
-            SELECT
-                probability_target,
-                MIN(probability_target_smoothed) AS min_probability_target_smoothed,
-                MAX(probability_target_smoothed) AS max_probability_target_smoothed,
-                MIN(probability_logit_target) AS min_probability_logit_target,
-                MAX(probability_logit_target) AS max_probability_logit_target,
-                COUNT(*) AS rows
-            FROM {OUTPUT_FEATURE_TABLE}
-            GROUP BY probability_target
-            ORDER BY probability_target
-        """)
-    )
-
-    print("Validation 5: rows per product-store")
-    display(
-        spark.sql(f"""
-            SELECT
-                MIN(rows_per_product_store) AS min_rows_per_product_store,
-                MAX(rows_per_product_store) AS max_rows_per_product_store,
-                AVG(rows_per_product_store) AS avg_rows_per_product_store,
-                MIN(weeks_per_product_store) AS min_weeks_per_product_store,
-                MAX(weeks_per_product_store) AS max_weeks_per_product_store,
-                AVG(weeks_per_product_store) AS avg_weeks_per_product_store
-            FROM {OUTPUT_FEATURE_TABLE}
-        """)
-    )
-
-    print("Validation 6: CCE columns check")
-    display(
-        spark.sql(f"""
-            SELECT
-                COUNT(*) AS rows,
-                AVG(cce_week_avg_log_quantity) AS avg_cce_week_qty,
-                AVG(cce_week_avg_log_price) AS avg_cce_week_price,
-                AVG(cce_store_week_avg_log_quantity) AS avg_cce_store_week_qty,
-                AVG(cce_store_week_avg_log_price) AS avg_cce_store_week_price
-            FROM {OUTPUT_FEATURE_TABLE}
-        """)
-    )
-
-    print("Sample feature rows")
-    display(
-        spark.sql(f"""
-            SELECT
-                date,
-                wm_yr_wk,
-                pe_article,
-                pe_store_group,
-                pe_article_store_group,
-                pe_quantity,
-                pe_unit_price,
-                discount,
-                valid_price_flag,
-                valid_for_price_elasticity,
-                valid_for_causal_training,
-                valid_for_sales_training,
-                valid_for_probability_training,
-                valid_for_probability_training_with_price,
-                valid_for_mdo_input,
-                log_quantity,
-                log_price,
-                sold_qty_log,
-                probability_target,
-                probability_target_smoothed,
-                probability_logit_target,
-                discount_power_1,
-                discount_power_2,
-                discount_power_3,
-                discount_power_4,
-                log_store_stock_quantity,
-                log_inventory_onhand_quantity,
-                cce_week_avg_log_quantity,
-                cce_week_avg_log_price,
-                cce_store_week_avg_log_quantity,
-                cce_store_week_avg_log_price
-            FROM {OUTPUT_FEATURE_TABLE}
-            ORDER BY pe_store_group, pe_article, wm_yr_wk
-            LIMIT 100
         """)
     )
 
     print("==============================================")
-    print("PE Feature Engineering Completed Successfully")
+    print("DAILY PE Feature Engineering Completed Successfully")
     print("==============================================")
 
     return feature_df
@@ -782,7 +752,5 @@ def run_causal_feature_engineering():
 # 11. Execute
 # ============================================================
 
-causal_features_df = run_causal_feature_engineering()
-
 if __name__ == "__main__":
-    run_causal_feature_engineering()
+    causal_features_df = run_causal_feature_engineering()

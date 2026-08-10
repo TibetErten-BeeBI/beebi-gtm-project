@@ -1,23 +1,70 @@
 import sys
+import os
+import importlib.util
 import datetime
 from typing import Dict, List, Tuple
 
 import mlflow
-# ============================================================
-# MLflow experiment setup for Databricks Jobs
-# ============================================================
-
-MLFLOW_EXPERIMENT_NAME = "/Users/vadali.tejasviram@beebi-consulting.com/PE_MDO_Model_Experiments"
-
-mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 import numpy as np
 import pandas as pd
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+
 # ============================================================
-# 1. Project setup
+# 1. Spark setup
+# ============================================================
+
+spark = SparkSession.builder.getOrCreate()
+
+
+# ============================================================
+# 2. Parameter helper
+# ============================================================
+
+def get_param(param_name: str, default_value: str = "") -> str:
+    """
+    Reads parameter from:
+    1. Python file job arguments:
+       --param_name value
+       --param_name=value
+    2. Databricks widgets
+    3. Default value
+    """
+    arg_key = f"--{param_name}"
+
+    if arg_key in sys.argv:
+        arg_index = sys.argv.index(arg_key)
+        if arg_index + 1 < len(sys.argv):
+            return sys.argv[arg_index + 1].strip()
+
+    for arg in sys.argv:
+        arg = str(arg).strip()
+        if arg.startswith(arg_key + "="):
+            return arg.split("=", 1)[1].strip()
+
+    try:
+        dbutils.widgets.text(param_name, default_value)
+        return dbutils.widgets.get(param_name).strip()
+    except Exception:
+        return default_value
+
+
+# ============================================================
+# 3. MLflow experiment setup
+# ============================================================
+
+MLFLOW_EXPERIMENT_NAME = get_param(
+    "mlflow_experiment_name",
+    "/Users/vadali.tejasviram@beebi-consulting.com/PE_MDO_Model_Experiments"
+)
+
+mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+
+# ============================================================
+# 4. Project setup
 # ============================================================
 
 try:
@@ -36,15 +83,12 @@ except Exception:
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-spark = SparkSession.builder.getOrCreate()
+print("Project root:", PROJECT_ROOT)
 
 
 # ============================================================
-# 2. Optional MixedLinear import
+# 5. Optional MixedLinear import
 # ============================================================
-
-import os
-import importlib.util
 
 MIXED_LINEAR_AVAILABLE = False
 MixedLinear = None
@@ -98,28 +142,59 @@ if not MIXED_LINEAR_AVAILABLE:
 
 
 # ============================================================
-# 3. Result wrappers for fixed-effect causal model
+# 6. Result wrappers for fixed-effect causal model
 # ============================================================
 
 class ParameterContainer:
-    def __init__(self, fe_params: Dict[str, float]):
+    def __init__(self, fe_params: Dict[str, float], random_effects_by_group: Dict = None):
         self.fe_params = fe_params
+        self.random_effects_by_group = random_effects_by_group or {}
 
 
 class SimpleCausalResults:
-    def __init__(self, fe_params: Dict[str, float], model_type: str):
-        self.parameters = ParameterContainer(fe_params)
+    def __init__(self, fe_params: Dict[str, float], model_type: str, random_effects_by_group: Dict = None):
+        self.parameters = ParameterContainer(
+            fe_params=fe_params,
+            random_effects_by_group=random_effects_by_group or {},
+        )
         self.model_type = model_type
 
 
 # ============================================================
-# 4. Config
+# 7. Config
 # ============================================================
+
+OUTPUT_SCHEMA = get_param("output_schema", "workspace.default")
+TABLE_PREFIX = get_param("table_prefix", "")
+
+MIN_HISTORY_POINTS_FOR_PANEL_TRAINING_DAYS = int(
+    get_param("min_history_points_for_panel_training_days", "28")
+)
+
+MAX_PANDAS_ROWS = int(
+    get_param("max_pandas_rows", "200000")
+)
+
+
+def table_name(base_name: str) -> str:
+    if TABLE_PREFIX:
+        return f"{OUTPUT_SCHEMA}.{TABLE_PREFIX}_{base_name}"
+    return f"{OUTPUT_SCHEMA}.{base_name}"
+
+
+def view_name(base_name: str) -> str:
+    if TABLE_PREFIX:
+        return f"{TABLE_PREFIX}_{base_name}"
+    return base_name
+
 
 def get_common_config() -> Dict:
     return {
-        "input_table": "workspace.default.pe_causal_features_dev",
+        "input_table": table_name("pe_causal_features_dev"),
 
+        # Daily grain identity:
+        # Main row grain is date + article + store.
+        # wm_yr_wk is kept only as helper information.
         "date_col": "date",
         "week_col": "wm_yr_wk",
         "article_col": "pe_article",
@@ -132,13 +207,21 @@ def get_common_config() -> Dict:
         "valid_price_col": "valid_price_flag",
 
         "orthogonalize_when_possible": True,
-        "minimum_history_points_for_panel_training": 4,
+
+        # Daily version:
+        # Old weekly code used 4 observations.
+        # For daily, 4 weeks roughly means 28 daily observations.
+        "minimum_history_points_for_panel_training": MIN_HISTORY_POINTS_FOR_PANEL_TRAINING_DAYS,
 
         "candidate_control_cols": [
             "log_store_stock_quantity",
             "log_inventory_onhand_quantity",
             "snap",
             "calendar_month",
+            "day_of_week",
+            "day_of_month",
+            "week_of_year",
+            "is_weekend",
         ],
 
         "scenario_discounts": [
@@ -183,9 +266,8 @@ def get_branch_config(branch_name: str, model_family: str) -> Dict:
         valid_training_col = "valid_for_probability_training_with_price"
         target_scale = "logit_probability"
 
-        # Important stabilization fix:
+        # Stabilization:
         # Use only discount_power_1 for probability.
-        # This prevents unstable polynomial logit effects.
         effect_power = 1
 
     else:
@@ -193,11 +275,11 @@ def get_branch_config(branch_name: str, model_family: str) -> Dict:
 
     if model_family == "causal_fixed_effect":
         model_suffix = "causal"
-        model_name = f"{branch_name}_causal_discount_model"
+        model_name = f"{branch_name}_causal_discount_model_daily"
 
     elif model_family == "mixed_linear":
         model_suffix = "mixedlinear"
-        model_name = f"{branch_name}_mixedlinear_discount_model"
+        model_name = f"{branch_name}_mixedlinear_discount_model_daily"
 
     else:
         raise ValueError(f"Unsupported model_family: {model_family}")
@@ -214,18 +296,18 @@ def get_branch_config(branch_name: str, model_family: str) -> Dict:
         "effect_power": effect_power,
         "require_valid_training_rows": True,
 
-        "output_table": f"workspace.default.pe_{branch_name}_{model_suffix}_counterfactual",
-        "summary_table": f"workspace.default.pe_{branch_name}_{model_suffix}_summary",
+        "output_table": table_name(f"pe_{branch_name}_{model_suffix}_counterfactual"),
+        "summary_table": table_name(f"pe_{branch_name}_{model_suffix}_summary"),
 
-        "output_view": f"pe_{branch_name}_{model_suffix}_counterfactual_view",
-        "summary_view": f"pe_{branch_name}_{model_suffix}_summary_view",
+        "output_view": view_name(f"pe_{branch_name}_{model_suffix}_counterfactual_view"),
+        "summary_view": view_name(f"pe_{branch_name}_{model_suffix}_summary_view"),
     })
 
     return config
 
 
 # ============================================================
-# 5. Helpers
+# 8. Helpers
 # ============================================================
 
 def choose_existing_column(
@@ -281,6 +363,26 @@ def find_available_columns(
 
 
 def find_cce_columns(pdf: pd.DataFrame) -> List[str]:
+    """
+    Daily version:
+    Prefer daily CCE columns.
+
+    If daily CCE columns exist, use only daily CCE columns for
+    orthogonalization.
+
+    If daily CCE columns do not exist, fall back to whatever cce_* columns
+    are available so the file remains backward-compatible.
+    """
+
+    daily_cce_cols = [
+        col_name
+        for col_name in pdf.columns
+        if col_name.startswith("cce_") and "_day_" in col_name
+    ]
+
+    if daily_cce_cols:
+        return daily_cce_cols
+
     return [
         col_name
         for col_name in pdf.columns
@@ -357,8 +459,178 @@ def sigmoid_np(values):
     return 1.0 / (1.0 + np.exp(-clipped_values))
 
 
+def validate_daily_feature_table(sdf, config: Dict):
+    if "base_data_grain" in sdf.columns:
+        grains = [
+            row["base_data_grain"]
+            for row in sdf.select("base_data_grain").distinct().collect()
+        ]
+
+        print("Feature table grain values:", grains)
+
+        if "product_store_day" not in grains:
+            raise ValueError(
+                "This daily causal model expects product_store_day features. "
+                f"Found base_data_grain values: {grains}. "
+                "Run daily base data and daily feature engineering first."
+            )
+
+    duplicate_count = (
+        sdf
+        .groupBy(
+            config["date_col"],
+            config["article_col"],
+            config["store_col"],
+        )
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+    )
+
+    if duplicate_count > 0:
+        raise ValueError(
+            f"Feature table has duplicate product-store-date keys: {duplicate_count}. "
+            "Expected one row per date + product + store."
+        )
+
+
+def run_pre_model_quality_gate(sdf, config: Dict):
+    """
+    Production safety gate before PE model training.
+
+    It creates:
+        <table_prefix>_pe_data_quality_gate_summary
+
+    It fails only for hard data problems:
+        - duplicate daily grain
+        - no training rows
+        - invalid discount values
+    """
+
+    print("==================================================")
+    print("Running pre-model PE data quality gate")
+    print("==================================================")
+
+    date_col = config["date_col"]
+    article_col = config["article_col"]
+    store_col = config["store_col"]
+    group_col = config["group_col"]
+    effect_col = config["effect_col"]
+    valid_col = config["valid_training_col"]
+
+    total_rows = sdf.count()
+
+    duplicate_count = (
+        sdf
+        .groupBy(date_col, article_col, store_col)
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+    )
+
+    valid_training_rows = (
+        sdf
+        .filter(F.col(valid_col) == 1)
+        .count()
+    )
+
+    invalid_price_rows = 0
+    if "pe_unit_price" in sdf.columns:
+        invalid_price_rows = (
+            sdf
+            .filter(
+                (F.col("pe_unit_price").isNull()) |
+                (F.col("pe_unit_price") <= 0)
+            )
+            .count()
+        )
+
+    invalid_discount_rows = (
+        sdf
+        .filter(
+            (F.col(effect_col).isNull()) |
+            (F.col(effect_col) < 0) |
+            (F.col(effect_col) > 0.80)
+        )
+        .count()
+    )
+
+    group_quality = (
+        sdf
+        .filter(F.col(valid_col) == 1)
+        .groupBy(group_col)
+        .agg(
+            F.count("*").alias("history_rows"),
+            F.countDistinct(date_col).alias("days_count"),
+            F.countDistinct(effect_col).alias("discount_variation_count")
+        )
+        .withColumn(
+            "eligible_for_product_store_elasticity",
+            F.when(
+                (F.col("history_rows") >= F.lit(MIN_HISTORY_POINTS_FOR_PANEL_TRAINING_DAYS)) &
+                (F.col("discount_variation_count") >= F.lit(2)),
+                F.lit(1)
+            ).otherwise(F.lit(0))
+        )
+    )
+
+    eligible_groups = (
+        group_quality
+        .filter(F.col("eligible_for_product_store_elasticity") == 1)
+        .count()
+    )
+
+    total_groups = group_quality.count()
+
+    summary_rows = [
+        ("total_rows", str(total_rows)),
+        ("valid_training_rows", str(valid_training_rows)),
+        ("duplicate_product_store_date_rows", str(duplicate_count)),
+        ("invalid_price_rows", str(invalid_price_rows)),
+        ("invalid_discount_rows", str(invalid_discount_rows)),
+        ("total_product_store_groups", str(total_groups)),
+        ("eligible_product_store_elasticity_groups", str(eligible_groups)),
+        ("min_history_required_days", str(MIN_HISTORY_POINTS_FOR_PANEL_TRAINING_DAYS)),
+    ]
+
+    summary_df = spark.createDataFrame(summary_rows, ["metric", "value"])
+    summary_table = table_name("pe_data_quality_gate_summary")
+
+    (
+        summary_df.write
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(summary_table)
+    )
+
+    print("Data quality gate summary saved:", summary_table)
+
+    if duplicate_count > 0:
+        raise ValueError(
+            f"Duplicate product-store-date rows found: {duplicate_count}. "
+            "Fix base data before training PE models."
+        )
+
+    if valid_training_rows <= 0:
+        raise ValueError(
+            f"No valid rows for model training. Column checked: {valid_col}"
+        )
+
+    if invalid_discount_rows > 0:
+        raise ValueError(
+            f"Invalid discount rows found: {invalid_discount_rows}. "
+            "Discount should be between 0 and 0.80."
+        )
+
+    if eligible_groups == 0:
+        print("WARNING: No product-store group has enough discount variation.")
+        print("Model will fall back to global elasticity effect.")
+
+    print("Pre-model PE data quality gate completed.")
+
+
 # ============================================================
-# 6. Load and prepare data
+# 9. Load and prepare data
 # ============================================================
 
 def load_causal_feature_data(config: Dict) -> pd.DataFrame:
@@ -366,7 +638,16 @@ def load_causal_feature_data(config: Dict) -> pd.DataFrame:
 
     sdf = spark.table(config["input_table"])
 
+    validate_daily_feature_table(sdf, config)
+    run_pre_model_quality_gate(sdf, config)
+
     valid_col = config["valid_training_col"]
+
+    if valid_col not in sdf.columns:
+        raise ValueError(
+            f"Missing required valid training column: {valid_col}. "
+            f"Available columns: {sdf.columns}"
+        )
 
     # Filter in Spark before converting to Pandas.
     sdf = sdf.filter(F.col(valid_col) == 1)
@@ -383,6 +664,8 @@ def load_causal_feature_data(config: Dict) -> pd.DataFrame:
         config["effect_col"],
         config["valid_training_col"],
         config["valid_price_col"],
+
+        "base_data_grain",
 
         "pe_quantity",
         "pe_unit_price",
@@ -409,6 +692,17 @@ def load_causal_feature_data(config: Dict) -> pd.DataFrame:
         "log_inventory_onhand_quantity",
         "snap",
         "calendar_month",
+        "calendar_year",
+        "day_of_week",
+        "day_of_month",
+        "week_of_year",
+        "is_weekend",
+
+        "rows_per_product_store",
+        "days_per_product_store",
+        "weeks_per_product_store",
+        "price_variation_count",
+        "discount_variation_count",
     ]
 
     cce_cols = [
@@ -432,20 +726,18 @@ def load_causal_feature_data(config: Dict) -> pd.DataFrame:
     if row_count == 0:
         raise ValueError("Input causal feature table is empty after filtering.")
 
-    max_pandas_rows = 200000
-
-    if row_count > max_pandas_rows:
-        fraction = max_pandas_rows / row_count
+    if row_count > MAX_PANDAS_ROWS:
+        fraction = MAX_PANDAS_ROWS / row_count
 
         print("Sampling causal training data to avoid Python memory crash.")
         print("Original rows:", row_count)
-        print("Target max rows:", max_pandas_rows)
+        print("Target max rows:", MAX_PANDAS_ROWS)
         print("Sample fraction:", fraction)
 
         sdf = (
             sdf
             .sample(withReplacement=False, fraction=fraction, seed=42)
-            .limit(max_pandas_rows)
+            .limit(MAX_PANDAS_ROWS)
         )
 
     pdf = sdf.toPandas()
@@ -603,6 +895,7 @@ def prepare_training_data(config: Dict) -> Dict:
     print("Max rows per group:", max_rows_per_group)
     print("Avg rows per group:", avg_rows_per_group)
     print("Groups with repeated rows:", repeated_group_count)
+    print("Required daily history points:", config["minimum_history_points_for_panel_training"])
     print("Can use panel model:", can_use_panel_model)
     print("Date range:", pdf[config["date_col"]].min(), "to", pdf[config["date_col"]].max())
 
@@ -621,7 +914,7 @@ def prepare_training_data(config: Dict) -> Dict:
 
 
 # ============================================================
-# 7. CCE orthogonalization
+# 10. CCE orthogonalization
 # ============================================================
 
 def can_run_orthogonalization(
@@ -632,7 +925,7 @@ def can_run_orthogonalization(
         return False
 
     if not train_objects["can_use_panel_model"]:
-        print("Skipping CCE orthogonalization because product-store groups do not have enough rows.")
+        print("Skipping CCE orthogonalization because product-store groups do not have enough daily rows.")
         return False
 
     if not train_objects["cce_cols"]:
@@ -685,7 +978,7 @@ def apply_cce_orthogonalization(
     if not can_run_orthogonalization(train_objects, config):
         return pdf, False
 
-    print("Running CCE orthogonalization.")
+    print("Running daily CCE orthogonalization.")
 
     pdf["intercept"] = 1.0
 
@@ -710,7 +1003,7 @@ def apply_cce_orthogonalization(
 
 
 # ============================================================
-# 8. Model training
+# 11. Model training
 # ============================================================
 
 def train_fixed_effect_causal_model(
@@ -752,6 +1045,7 @@ def train_fixed_effect_causal_model(
     return SimpleCausalResults(
         fe_params=fe_params,
         model_type="causal_fixed_effect",
+        random_effects_by_group={},
     )
 
 
@@ -766,6 +1060,9 @@ def train_mixed_linear_model(
     If MixedLinear is not available or fails, use fixed-effect fallback.
     This prevents the notebook from failing and still creates the required
     mixedlinear output tables used by predictive_model_dev.py.
+
+    Daily version:
+    date_col is now exact date, not weekly date.
     """
 
     if not MIXED_LINEAR_AVAILABLE:
@@ -862,7 +1159,7 @@ def train_model_by_family(
 
 
 # ============================================================
-# 9. Counterfactual helpers
+# 12. Counterfactual helpers
 # ============================================================
 
 def polynomial_value(
@@ -891,8 +1188,389 @@ def get_discount_coefs(
     return coefs
 
 
+def get_random_discount_effect_for_group(
+    results,
+    group_value,
+) -> Tuple[float, int, str]:
+    """
+    Reads product-store random discount effect from MixedLinear results.
+
+    Different MixedLinear implementations can store random effects differently.
+    This function is defensive:
+        - dict by group
+        - nested dict
+        - scalar
+        - missing random effects
+    """
+
+    random_effects_by_group = getattr(
+        getattr(results, "parameters", None),
+        "random_effects_by_group",
+        {}
+    )
+
+    if not random_effects_by_group:
+        return 0.0, 0, "no_random_effects_found"
+
+    keys_to_try = [
+        group_value,
+        str(group_value),
+    ]
+
+    selected_random_effect = None
+
+    for key in keys_to_try:
+        if key in random_effects_by_group:
+            selected_random_effect = random_effects_by_group.get(key)
+            break
+
+    if selected_random_effect is None:
+        return 0.0, 0, "group_random_effect_missing"
+
+    if isinstance(selected_random_effect, dict):
+        for possible_key in [
+            "random_discount",
+            "discount",
+            "discount_power_1",
+            "random_effect_discount",
+            "x_re_discount",
+        ]:
+            if possible_key in selected_random_effect:
+                value = selected_random_effect.get(possible_key)
+                try:
+                    value = float(value)
+                    return value, 1 if abs(value) > 0 else 0, "product_store_random_effect"
+                except Exception:
+                    continue
+
+        numeric_values = []
+        for value in selected_random_effect.values():
+            try:
+                numeric_values.append(float(value))
+            except Exception:
+                pass
+
+        if numeric_values:
+            value = float(numeric_values[0])
+            return value, 1 if abs(value) > 0 else 0, "product_store_random_effect_first_numeric"
+
+        return 0.0, 0, "random_effect_dict_without_numeric_value"
+
+    try:
+        value = float(selected_random_effect)
+        return value, 1 if abs(value) > 0 else 0, "product_store_random_effect_scalar"
+    except Exception:
+        return 0.0, 0, "random_effect_unreadable"
+
+
+def calculate_direct_elasticity_for_group(group_pdf: pd.DataFrame) -> Dict:
+    """
+    Estimate direct product-store elasticity using a log-log relationship.
+
+    Formula:
+        log(quantity) = intercept + elasticity * log(price / base_price)
+
+    For markdown pricing, a good elasticity is normally negative.
+    """
+
+    work_pdf = group_pdf.copy()
+
+    required_cols = [
+        "pe_quantity",
+        "pe_unit_price",
+        "pe_average_zone_retail_price",
+    ]
+
+    for col_name in required_cols:
+        if col_name not in work_pdf.columns:
+            return {
+                "estimated_elasticity": None,
+                "elasticity_source": "missing_required_columns",
+                "elasticity_status": "fallback_needed",
+            }
+
+    work_pdf["pe_quantity"] = pd.to_numeric(
+        work_pdf["pe_quantity"],
+        errors="coerce"
+    )
+    work_pdf["pe_unit_price"] = pd.to_numeric(
+        work_pdf["pe_unit_price"],
+        errors="coerce"
+    )
+    work_pdf["pe_average_zone_retail_price"] = pd.to_numeric(
+        work_pdf["pe_average_zone_retail_price"],
+        errors="coerce"
+    )
+
+    work_pdf = work_pdf[
+        (work_pdf["pe_quantity"] > 0) &
+        (work_pdf["pe_unit_price"] > 0) &
+        (work_pdf["pe_average_zone_retail_price"] > 0)
+    ].copy()
+
+    if len(work_pdf) < 28:
+        return {
+            "estimated_elasticity": None,
+            "elasticity_source": "insufficient_history",
+            "elasticity_status": "fallback_needed",
+        }
+
+    work_pdf["log_quantity"] = np.log(work_pdf["pe_quantity"])
+
+    work_pdf["log_price_ratio"] = np.log(
+        work_pdf["pe_unit_price"] /
+        work_pdf["pe_average_zone_retail_price"]
+    )
+
+    work_pdf = work_pdf.replace([np.inf, -np.inf], np.nan)
+    work_pdf = work_pdf.dropna(
+        subset=[
+            "log_quantity",
+            "log_price_ratio",
+        ]
+    )
+
+    if len(work_pdf) < 28:
+        return {
+            "estimated_elasticity": None,
+            "elasticity_source": "insufficient_clean_history",
+            "elasticity_status": "fallback_needed",
+        }
+
+    if work_pdf["log_price_ratio"].nunique() < 2:
+        return {
+            "estimated_elasticity": None,
+            "elasticity_source": "insufficient_price_variation",
+            "elasticity_status": "fallback_needed",
+        }
+
+    x = work_pdf["log_price_ratio"].astype(float).to_numpy()
+    y = work_pdf["log_quantity"].astype(float).to_numpy()
+
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+
+    denominator = float(np.sum((x - x_mean) ** 2))
+
+    if denominator <= 0:
+        return {
+            "estimated_elasticity": None,
+            "elasticity_source": "zero_price_variance",
+            "elasticity_status": "fallback_needed",
+        }
+
+    numerator = float(np.sum((x - x_mean) * (y - y_mean)))
+    elasticity = numerator / denominator
+
+    if elasticity >= 0:
+        return {
+            "estimated_elasticity": None,
+            "elasticity_source": "positive_or_invalid_elasticity",
+            "elasticity_status": "fallback_needed",
+        }
+
+    elasticity = max(-5.0, min(-0.05, float(elasticity)))
+
+    return {
+        "estimated_elasticity": elasticity,
+        "elasticity_source": "product_store_log_log",
+        "elasticity_status": "direct_estimate",
+    }
+
+
+def create_sales_discount_coefficients_table(
+    training_pdf: pd.DataFrame,
+    results,
+    config: Dict,
+):
+    """
+    Creates product-store level sales discount coefficients.
+
+    Main PE correction:
+    Instead of using only one global discount coefficient,
+    this creates one coefficient row per pe_article_store_group.
+
+    Output:
+        <table_prefix>_pe_sales_discount_coefficients
+    """
+
+    if config["branch_name"] != "sales":
+        return None
+
+    print("==================================================")
+    print("Creating product-store sales discount coefficient table")
+    print("==================================================")
+
+    group_col = config["group_col"]
+    article_col = config["article_col"]
+    store_col = config["store_col"]
+    effect_col = config["effect_col"]
+
+    global_coefs = get_discount_coefs(results, config)
+
+    while len(global_coefs) < 4:
+        global_coefs.append(0.0)
+
+    base_cols = [
+        group_col,
+        article_col,
+        store_col,
+    ]
+
+    optional_cols = [
+        "pe_category",
+        "pe_product_type",
+        "pe_product_division",
+        "pe_country",
+    ]
+
+    for col_name in optional_cols:
+        if col_name in training_pdf.columns:
+            base_cols.append(col_name)
+
+    base_info = (
+        training_pdf[base_cols]
+        .drop_duplicates(subset=[group_col])
+        .copy()
+    )
+
+    group_stats = (
+        training_pdf
+        .groupby(group_col)
+        .agg(
+            history_rows=(group_col, "count"),
+            discount_variation_count=(effect_col, "nunique")
+        )
+        .reset_index()
+    )
+
+    coeff_pdf = base_info.merge(group_stats, on=group_col, how="left")
+
+    rows = []
+
+    for _, row in coeff_pdf.iterrows():
+        group_value = row[group_col]
+
+        group_training_pdf = training_pdf[
+            training_pdf[group_col] == group_value
+        ].copy()
+
+        direct_elasticity_result = calculate_direct_elasticity_for_group(
+            group_training_pdf
+        )
+
+        estimated_elasticity = direct_elasticity_result["estimated_elasticity"]
+        elasticity_source = direct_elasticity_result["elasticity_source"]
+        elasticity_status = direct_elasticity_result["elasticity_status"]
+
+        random_discount, random_effect_applied, coefficient_source = (
+            get_random_discount_effect_for_group(
+                results=results,
+                group_value=group_value,
+            )
+        )
+
+        coefficient_1 = float(global_coefs[0]) + float(random_discount)
+        coefficient_2 = float(global_coefs[1])
+        coefficient_3 = float(global_coefs[2])
+        coefficient_4 = float(global_coefs[3])
+
+        if estimated_elasticity is None:
+            # Safe fallback when direct elasticity is not reliable.
+            # This keeps the model usable for generic datasets,
+            # but direct log-log elasticity remains the preferred source.
+            approx_elasticity = -1.0 * abs(float(coefficient_1) / 0.20)
+
+            estimated_elasticity = max(-5.0, min(-0.05, approx_elasticity))
+            elasticity_source = "fallback_from_discount_coefficient"
+            elasticity_status = "fallback_estimate"
+
+        coefficient_level = (
+            "product_store"
+            if random_effect_applied == 1
+            else "global_fallback"
+        )
+
+        model_status = (
+            "using_product_store_random_effect"
+            if random_effect_applied == 1
+            else "using_global_fixed_effect_fallback"
+        )
+
+        rows.append({
+            "pe_article": row[article_col],
+            "pe_store_group": row[store_col],
+            "pe_article_store_group": row[group_col],
+
+            "pe_category": row["pe_category"] if "pe_category" in row else None,
+            "pe_product_type": row["pe_product_type"] if "pe_product_type" in row else None,
+            "pe_product_division": row["pe_product_division"] if "pe_product_division" in row else None,
+            "pe_country": row["pe_country"] if "pe_country" in row else None,
+
+            "coefficient_level": coefficient_level,
+            "coefficient_source": coefficient_source,
+            "model_status": model_status,
+
+            "discount_effect_coefficient_1": coefficient_1,
+            "discount_effect_coefficient_2": coefficient_2,
+            "discount_effect_coefficient_3": coefficient_3,
+            "discount_effect_coefficient_4": coefficient_4,
+
+            "estimated_elasticity": float(estimated_elasticity),
+            "elasticity_source": elasticity_source,
+            "elasticity_status": elasticity_status,
+
+            "global_discount_effect_coefficient_1": float(global_coefs[0]),
+            "random_discount_effect_coefficient_1": float(random_discount),
+
+            "history_rows": int(row["history_rows"]) if pd.notna(row["history_rows"]) else 0,
+            "discount_variation_count": int(row["discount_variation_count"]) if pd.notna(row["discount_variation_count"]) else 0,
+            "random_effect_applied": int(random_effect_applied),
+
+            "model_type": getattr(results, "model_type", "unknown"),
+            "model_family": config["model_family"],
+            "branch_name": config["branch_name"],
+            "model_created_at": datetime.datetime.now(datetime.timezone.utc),
+        })
+
+    output_pdf = pd.DataFrame(rows)
+
+    output_table = table_name("pe_sales_discount_coefficients")
+    output_sdf = spark.createDataFrame(output_pdf)
+
+    (
+        output_sdf.write
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(output_table)
+    )
+
+    print("Sales discount coefficient table saved:", output_table)
+
+    display(
+        spark.sql(f"""
+            SELECT
+                coefficient_level,
+                model_status,
+                COUNT(*) AS rows,
+                AVG(discount_effect_coefficient_1) AS avg_coef_1,
+                MIN(discount_effect_coefficient_1) AS min_coef_1,
+                MAX(discount_effect_coefficient_1) AS max_coef_1,
+                STDDEV(discount_effect_coefficient_1) AS stddev_coef_1,
+                AVG(estimated_elasticity) AS avg_estimated_elasticity,
+                MIN(estimated_elasticity) AS min_estimated_elasticity,
+                MAX(estimated_elasticity) AS max_estimated_elasticity,
+                STDDEV(estimated_elasticity) AS stddev_estimated_elasticity
+            FROM {output_table}
+            GROUP BY coefficient_level, model_status
+        """)
+    )
+
+    return output_table
+
+
 # ============================================================
-# 10. Sales counterfactual
+# 13. Sales counterfactual
 # ============================================================
 
 def create_sales_counterfactual_table(
@@ -900,7 +1578,7 @@ def create_sales_counterfactual_table(
     results,
     config: Dict,
 ) -> pd.DataFrame:
-    print("Creating sales counterfactual table.")
+    print("Creating daily sales counterfactual table.")
 
     target_col = config["active_target_col"]
     effect_col = config["effect_col"]
@@ -918,6 +1596,7 @@ def create_sales_counterfactual_table(
     ]
 
     optional_cols = [
+        "base_data_grain",
         "pe_quantity",
         "pe_unit_price",
         "pe_actual_retail_price",
@@ -1032,7 +1711,7 @@ def create_sales_counterfactual_table(
 
 
 # ============================================================
-# 11. Probability counterfactual on logit scale
+# 14. Probability counterfactual on logit scale
 # ============================================================
 
 def create_probability_counterfactual_table(
@@ -1040,7 +1719,7 @@ def create_probability_counterfactual_table(
     results,
     config: Dict,
 ) -> pd.DataFrame:
-    print("Creating probability counterfactual table on logit scale.")
+    print("Creating daily probability counterfactual table on logit scale.")
 
     target_col = config["active_target_col"]
     effect_col = config["effect_col"]
@@ -1058,6 +1737,7 @@ def create_probability_counterfactual_table(
     ]
 
     optional_cols = [
+        "base_data_grain",
         "probability_target",
         "probability_target_smoothed",
         "pe_quantity",
@@ -1201,7 +1881,7 @@ def create_probability_counterfactual_table(
 
 
 # ============================================================
-# 12. Summary
+# 15. Summary
 # ============================================================
 
 def create_summary_table(
@@ -1232,6 +1912,7 @@ def create_summary_table(
         ("max_rows_per_group", str(train_objects["max_rows_per_group"])),
         ("avg_rows_per_group", str(train_objects["avg_rows_per_group"])),
         ("repeated_group_count", str(train_objects["repeated_group_count"])),
+        ("minimum_history_points_for_panel_training_days", str(config["minimum_history_points_for_panel_training"])),
         ("can_use_panel_model", str(train_objects["can_use_panel_model"])),
         ("min_date", str(train_objects["data"][config["date_col"]].min())),
         ("max_date", str(train_objects["data"][config["date_col"]].max())),
@@ -1247,14 +1928,14 @@ def create_summary_table(
         rows.append(
             (
                 "note",
-                "Panel model path available: repeated product-store-week rows exist."
+                "Panel model path available: repeated product-store-day rows exist for product-store groups."
             )
         )
     else:
         rows.append(
             (
                 "note",
-                "Panel model path unavailable: not enough repeated product-store-week rows."
+                "Panel model path unavailable: not enough repeated product-store-day rows."
             )
         )
 
@@ -1278,7 +1959,7 @@ def create_summary_table(
 
 
 # ============================================================
-# 13. Runner
+# 16. Runner
 # ============================================================
 
 def create_counterfactual_table(
@@ -1305,9 +1986,11 @@ def create_counterfactual_table(
 
 def run_model_branch(config: Dict):
     print("==================================================")
-    print("Running model branch")
+    print("Running DAILY causal model branch")
     print("Branch:", config["branch_name"])
     print("Model family:", config["model_family"])
+    print("Input:", config["input_table"])
+    print("Output:", config["output_table"])
     print("==================================================")
 
     train_objects = prepare_training_data(config)
@@ -1333,6 +2016,11 @@ def run_model_branch(config: Dict):
         mlflow.log_param("training_rows", len(train_objects["data"]))
         mlflow.log_param("orthogonalized", orthogonalized)
         mlflow.log_param("can_use_panel_model", train_objects["can_use_panel_model"])
+        mlflow.log_param("daily_grain", "product_store_day")
+        mlflow.log_param(
+            "minimum_history_points_for_panel_training_days",
+            config["minimum_history_points_for_panel_training"]
+        )
 
         results = train_model_by_family(
             model_pdf=model_pdf,
@@ -1373,6 +2061,13 @@ def run_model_branch(config: Dict):
             .saveAsTable(config["summary_table"])
         )
 
+        if config["branch_name"] == "sales":
+            create_sales_discount_coefficients_table(
+                training_pdf=train_objects["data"],
+                results=results,
+                config=config,
+            )
+
         counterfactual_sdf.createOrReplaceTempView(config["output_view"])
         summary_sdf.createOrReplaceTempView(config["summary_view"])
 
@@ -1399,8 +2094,31 @@ def run_model_branch(config: Dict):
         spark.sql(f"""
             SELECT *
             FROM {config["output_table"]}
-            ORDER BY pe_store_group, pe_article, wm_yr_wk, scenario_discount
+            ORDER BY pe_store_group, pe_article, date, scenario_discount
             LIMIT 100
+        """)
+    )
+
+    print("Validation: daily counterfactual grain check")
+    display(
+        spark.sql(f"""
+            SELECT
+                COUNT(*) AS duplicate_keys
+            FROM (
+                SELECT
+                    date,
+                    pe_article,
+                    pe_store_group,
+                    scenario_discount,
+                    COUNT(*) AS rows_per_key
+                FROM {config["output_table"]}
+                GROUP BY
+                    date,
+                    pe_article,
+                    pe_store_group,
+                    scenario_discount
+                HAVING COUNT(*) > 1
+            )
         """)
     )
 
@@ -1408,13 +2126,16 @@ def run_model_branch(config: Dict):
 
 
 # ============================================================
-# 14. Full runner
+# 17. Full runner
 # ============================================================
 
 def run_all_model_branches():
     print("==================================================")
-    print("Running all required model branches")
+    print("Running all required DAILY causal model branches")
     print("==================================================")
+    print("Output schema:", OUTPUT_SCHEMA)
+    print("Table prefix:", TABLE_PREFIX)
+    print("Minimum daily history:", MIN_HISTORY_POINTS_FOR_PANEL_TRAINING_DAYS)
 
     configs = [
         get_branch_config("sales", "mixed_linear"),
@@ -1437,7 +2158,7 @@ def run_all_model_branches():
         }
 
     print("==================================================")
-    print("All required model branches completed")
+    print("All required DAILY causal model branches completed")
     print("==================================================")
 
     for key, value in outputs.items():
@@ -1449,7 +2170,8 @@ def run_all_model_branches():
 
 
 # ============================================================
-# 15. Execute
+# 18. Execute
 # ============================================================
+
 if __name__ == "__main__":
     model_outputs = run_all_model_branches()

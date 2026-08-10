@@ -152,6 +152,10 @@ def load_calendar():
         .filter(F.col("calendar_date").isNotNull())
         .filter(F.col("wm_yr_wk").isNotNull())
         .dropDuplicates(["calendar_date"])
+        .withColumn(
+            "week_start_date",
+            F.expr("date_sub(calendar_date, coalesce(cast(wday as int), 1) - 1)")
+        )
     )
 
     print("Calendar rows:", calendar_df.count())
@@ -160,10 +164,10 @@ def load_calendar():
 
 
 # ============================================================
-# 5. Sellout: wide daily sales columns to product-store-week
+# 5. Sellout: wide daily sales columns to product-store-day
 # ============================================================
 
-def build_weekly_sellout(calendar_df):
+def build_daily_sellout(calendar_df):
     require_table(SELLOUT_TABLE)
 
     raw_df = spark.table(SELLOUT_TABLE)
@@ -235,22 +239,19 @@ def build_weekly_sellout(calendar_df):
         .filter(F.col("wm_yr_wk").isNotNull())
     )
 
-    weekly_df = (
+    # Keep the base at daily grain. If there are duplicate raw rows for the
+    # same product-store-date, sum the daily quantity instead of dropping it.
+    daily_sellout_df = (
         daily_with_calendar_df
         .groupBy(
             "pe_article",
             "pe_store_group",
-            "wm_yr_wk"
+            "calendar_date"
         )
         .agg(
-            F.min("calendar_date").alias("week_start_date"),
-            F.max("calendar_date").alias("date"),
-
+            F.first("week_start_date", ignorenulls=True).alias("week_start_date"),
+            F.first("wm_yr_wk", ignorenulls=True).alias("wm_yr_wk"),
             F.sum("daily_quantity").alias("pe_quantity"),
-            F.count("*").alias("days_in_week"),
-            F.sum(
-                F.when(F.col("daily_quantity") > 0, F.lit(1)).otherwise(F.lit(0))
-            ).alias("days_sold_count"),
 
             F.first("sellout_product_group", ignorenulls=True).alias("sellout_product_group"),
             F.first("pe_country", ignorenulls=True).alias("pe_country"),
@@ -263,21 +264,30 @@ def build_weekly_sellout(calendar_df):
             F.first("source_total_return_quantity", ignorenulls=True).alias("source_total_return_quantity"),
             F.first("source_net_sales_amount", ignorenulls=True).alias("source_net_sales_amount"),
 
-            F.max("calendar_month").alias("calendar_month"),
-            F.max("calendar_year").alias("calendar_year"),
-            F.max("event_name_1").alias("event_name_1"),
-            F.max("event_type_1").alias("event_type_1"),
-            F.max("event_name_2").alias("event_name_2"),
-            F.max("event_type_2").alias("event_type_2"),
-            F.max("snap_CA").alias("snap_CA"),
-            F.max("snap_TX").alias("snap_TX"),
-            F.max("snap_WI").alias("snap_WI"),
+            F.first("calendar_month", ignorenulls=True).alias("calendar_month"),
+            F.first("calendar_year", ignorenulls=True).alias("calendar_year"),
+            F.first("calendar_day_id", ignorenulls=True).alias("calendar_day_id"),
+            F.first("weekday", ignorenulls=True).alias("weekday"),
+            F.first("wday", ignorenulls=True).alias("wday"),
+            F.first("event_name_1", ignorenulls=True).alias("event_name_1"),
+            F.first("event_type_1", ignorenulls=True).alias("event_type_1"),
+            F.first("event_name_2", ignorenulls=True).alias("event_name_2"),
+            F.first("event_type_2", ignorenulls=True).alias("event_type_2"),
+            F.first("snap_CA", ignorenulls=True).alias("snap_CA"),
+            F.first("snap_TX", ignorenulls=True).alias("snap_TX"),
+            F.first("snap_WI", ignorenulls=True).alias("snap_WI"),
+        )
+        .withColumnRenamed("calendar_date", "date")
+        .withColumn("days_in_week", F.lit(1))
+        .withColumn(
+            "days_sold_count",
+            F.when(F.col("pe_quantity") > 0, F.lit(1)).otherwise(F.lit(0))
         )
     )
 
-    print("Weekly sellout rows:", weekly_df.count())
+    print("Daily sellout rows:", daily_sellout_df.count())
 
-    return weekly_df
+    return daily_sellout_df
 
 
 # ============================================================
@@ -490,12 +500,16 @@ def load_stock_history():
         "stock"
     )
 
+    stock_date_expr = F.to_date(F.col(date_col))
+
     stock_df = (
         raw_df
         .select(
             F.col(article_col).alias("stock_article"),
             F.col(store_col).alias("stock_store"),
-            F.to_date(F.col(date_col)).alias("stock_date"),
+            stock_date_expr.alias("stock_date"),
+            F.date_sub(stock_date_expr, 6).alias("stock_start_date"),
+            stock_date_expr.alias("stock_end_date"),
             F.col(qty_col).cast("double").alias("raw_store_stock_quantity"),
 
             safe_column(raw_df, "row_hash_id", "stock_row_hash_id"),
@@ -544,10 +558,15 @@ def load_inventory_history():
         "inventory"
     )
 
-    date_col = required_column(
+    value_col = required_column(
         raw_df,
         ["value_date", "valuedate"],
         "inventory"
+    )
+
+    posting_col = first_available_column(
+        raw_df,
+        ["posting_date", "postingdate"]
     )
 
     qty_col = required_column(
@@ -556,12 +575,22 @@ def load_inventory_history():
         "inventory"
     )
 
+    inventory_end_expr = F.to_date(F.col(value_col))
+
+    if posting_col:
+        inventory_start_expr = F.to_date(F.col(posting_col))
+    else:
+        # Fallback for datasets where only an end date is available.
+        inventory_start_expr = F.date_sub(inventory_end_expr, 6)
+
     inventory_df = (
         raw_df
         .select(
             F.col(article_col).alias("inventory_article"),
             F.col(store_col).alias("inventory_store"),
-            F.to_date(F.col(date_col)).alias("inventory_date"),
+            inventory_end_expr.alias("inventory_date"),
+            inventory_start_expr.alias("inventory_start_date"),
+            inventory_end_expr.alias("inventory_end_date"),
             F.col(qty_col).cast("double").alias("raw_inventory_onhand_quantity"),
 
             safe_column(raw_df, "row_hash_id", "inventory_row_hash_id"),
@@ -573,7 +602,8 @@ def load_inventory_history():
         )
         .filter(F.col("inventory_article").isNotNull())
         .filter(F.col("inventory_store").isNotNull())
-        .filter(F.col("inventory_date").isNotNull())
+        .filter(F.col("inventory_start_date").isNotNull())
+        .filter(F.col("inventory_end_date").isNotNull())
     )
 
     inventory_df = deduplicate_by_latest(
@@ -581,10 +611,12 @@ def load_inventory_history():
         key_cols=[
             "inventory_article",
             "inventory_store",
-            "inventory_date",
+            "inventory_start_date",
+            "inventory_end_date",
         ],
         order_cols=[
-            "inventory_date",
+            "inventory_start_date",
+            "inventory_end_date",
         ],
     )
 
@@ -599,12 +631,13 @@ def load_inventory_history():
 
 def create_base_data_table():
     print("====================================================")
-    print("Building base_data_table at product-store-week grain")
+    print("Building base_data_table at product-store-day grain")
+    print("Daily version: one row per product, store, and date")
     print("Long-run version: keep all stores and flag missing source data")
     print("====================================================")
 
     calendar_df = load_calendar()
-    weekly_sellout_df = build_weekly_sellout(calendar_df)
+    daily_sellout_df = build_daily_sellout(calendar_df)
 
     article_df = load_article_list()
     product_df = load_product_attributes()
@@ -617,13 +650,13 @@ def create_base_data_table():
     print("Joining article, product, and store attributes.")
 
     base_df = (
-        weekly_sellout_df
+        daily_sellout_df
         .join(article_df, on="pe_article", how="inner")
         .join(product_df, on="pe_article", how="left")
         .join(store_df, on="pe_store_group", how="inner")
     )
 
-    print("Joining price history. Missing price rows will be kept and flagged.")
+    print("Joining price history by daily date range. Missing price rows will be kept and flagged.")
 
     base_df = (
         base_df.alias("b")
@@ -632,8 +665,8 @@ def create_base_data_table():
             on=[
                 F.col("b.pe_article") == F.col("p.price_article"),
                 F.col("b.pe_store_group") == F.col("p.price_store"),
-                F.col("b.week_start_date") <= F.col("p.price_end_date"),
                 F.col("b.date") >= F.col("p.price_start_date"),
+                F.col("b.date") <= F.col("p.price_end_date"),
             ],
             how="left"
         )
@@ -642,7 +675,7 @@ def create_base_data_table():
     price_window = Window.partitionBy(
         "pe_article",
         "pe_store_group",
-        "wm_yr_wk"
+        "date"
     ).orderBy(
         F.when(F.col("price_data_quality_flag") == "MAPPED", F.lit(1)).otherwise(F.lit(0)).desc(),
         F.col("price_start_date").desc_nulls_last(),
@@ -656,7 +689,7 @@ def create_base_data_table():
         .drop("_price_rank", "price_article", "price_store")
     )
 
-    print("Joining stock. Missing stock rows will be kept and flagged.")
+    print("Joining stock by daily date range. Missing stock rows will be kept and flagged.")
 
     base_df = (
         base_df.alias("b")
@@ -665,14 +698,30 @@ def create_base_data_table():
             on=[
                 F.col("b.pe_article") == F.col("s.stock_article"),
                 F.col("b.pe_store_group") == F.col("s.stock_store"),
-                F.col("b.date") == F.col("s.stock_date"),
+                F.col("b.date") >= F.col("s.stock_start_date"),
+                F.col("b.date") <= F.col("s.stock_end_date"),
             ],
             how="left"
         )
-        .drop("stock_article", "stock_store")
     )
 
-    print("Joining inventory. Missing inventory rows will be kept and flagged.")
+    stock_window = Window.partitionBy(
+        "pe_article",
+        "pe_store_group",
+        "date"
+    ).orderBy(
+        F.col("stock_end_date").desc_nulls_last(),
+        F.col("stock_start_date").desc_nulls_last()
+    )
+
+    base_df = (
+        base_df
+        .withColumn("_stock_rank", F.row_number().over(stock_window))
+        .filter(F.col("_stock_rank") == 1)
+        .drop("_stock_rank", "stock_article", "stock_store")
+    )
+
+    print("Joining inventory by daily date range. Missing inventory rows will be kept and flagged.")
 
     base_df = (
         base_df.alias("b")
@@ -681,18 +730,34 @@ def create_base_data_table():
             on=[
                 F.col("b.pe_article") == F.col("i.inventory_article"),
                 F.col("b.pe_store_group") == F.col("i.inventory_store"),
-                F.col("b.date") == F.col("i.inventory_date"),
+                F.col("b.date") >= F.col("i.inventory_start_date"),
+                F.col("b.date") <= F.col("i.inventory_end_date"),
             ],
             how="left"
         )
-        .drop("inventory_article", "inventory_store")
+    )
+
+    inventory_window = Window.partitionBy(
+        "pe_article",
+        "pe_store_group",
+        "date"
+    ).orderBy(
+        F.col("inventory_end_date").desc_nulls_last(),
+        F.col("inventory_start_date").desc_nulls_last()
+    )
+
+    base_df = (
+        base_df
+        .withColumn("_inventory_rank", F.row_number().over(inventory_window))
+        .filter(F.col("_inventory_rank") == 1)
+        .drop("_inventory_rank", "inventory_article", "inventory_store")
     )
 
     print("Creating PE and MDO fields.")
 
     base_df = (
         base_df
-        .withColumn("base_data_grain", F.lit("product_store_week"))
+        .withColumn("base_data_grain", F.lit("product_store_day"))
         .withColumn(
             "base_data_hash_id",
             F.sha2(
@@ -700,7 +765,7 @@ def create_base_data_table():
                     "||",
                     F.col("pe_article"),
                     F.col("pe_store_group"),
-                    F.col("wm_yr_wk").cast("string")
+                    F.col("date").cast("string")
                 ),
                 256
             )
@@ -844,14 +909,14 @@ def create_base_data_table():
         )
 
         # Do not filter on price/stock/inventory here.
-        # Keep all product-store-week rows from sellout.
+        # Keep all product-store-day rows from sellout.
         .filter(F.col("pe_article").isNotNull())
         .filter(F.col("pe_store_group").isNotNull())
-        .filter(F.col("wm_yr_wk").isNotNull())
         .filter(F.col("date").isNotNull())
+        .filter(F.col("wm_yr_wk").isNotNull())
         .filter(F.col("pe_quantity").isNotNull())
         .filter(F.col("pe_quantity") >= 0)
-        .dropDuplicates(["pe_article", "pe_store_group", "wm_yr_wk"])
+        .dropDuplicates(["pe_article", "pe_store_group", "date"])
     )
 
     selected_columns = [
@@ -863,6 +928,9 @@ def create_base_data_table():
         "wm_yr_wk",
         "calendar_month",
         "calendar_year",
+        "calendar_day_id",
+        "weekday",
+        "wday",
 
         "pe_article",
         "pe_store_group",
@@ -890,6 +958,12 @@ def create_base_data_table():
         "pe_inventory_onhand_quantity_for_model",
         "stock_available_flag",
         "inventory_available_flag",
+        "stock_date",
+        "stock_start_date",
+        "stock_end_date",
+        "inventory_date",
+        "inventory_start_date",
+        "inventory_end_date",
 
         "is_sold",
         "probability_target",
@@ -971,6 +1045,7 @@ def create_quality_summary(base_df):
         .agg(
             F.count("*").alias("rows"),
             F.countDistinct("pe_article").alias("products"),
+            F.countDistinct("date").alias("days"),
             F.countDistinct("wm_yr_wk").alias("weeks"),
             F.countDistinct("pe_article_store_group").alias("product_store_groups"),
 
@@ -1030,14 +1105,17 @@ def run_base_data_build():
     display(
         spark.sql(f"""
             SELECT
+                base_data_grain,
                 COUNT(*) AS rows,
                 COUNT(DISTINCT pe_article) AS products,
                 COUNT(DISTINCT pe_store_group) AS stores,
                 COUNT(DISTINCT pe_article_store_group) AS product_store_groups,
+                COUNT(DISTINCT date) AS days,
                 COUNT(DISTINCT wm_yr_wk) AS weeks,
                 MIN(date) AS min_date,
                 MAX(date) AS max_date
             FROM {OUTPUT_BASE_TABLE}
+            GROUP BY base_data_grain
         """)
     )
 
@@ -1101,6 +1179,24 @@ def run_base_data_build():
         """)
     )
 
+    print("Validation 6: one row per product-store-date check")
+    display(
+        spark.sql(f"""
+            SELECT
+                COUNT(*) AS duplicate_keys
+            FROM (
+                SELECT
+                    pe_article,
+                    pe_store_group,
+                    date,
+                    COUNT(*) AS rows_per_key
+                FROM {OUTPUT_BASE_TABLE}
+                GROUP BY pe_article, pe_store_group, date
+                HAVING COUNT(*) > 1
+            )
+        """)
+    )
+
     print("Sample output")
     display(
         spark.sql(f"""
@@ -1108,6 +1204,8 @@ def run_base_data_build():
                 date,
                 week_start_date,
                 wm_yr_wk,
+                weekday,
+                wday,
                 pe_article,
                 pe_store_group,
                 pe_article_store_group,
@@ -1133,13 +1231,13 @@ def run_base_data_build():
                 pe_store_state,
                 snap
             FROM {OUTPUT_BASE_TABLE}
-            ORDER BY pe_store_group, pe_article, wm_yr_wk
+            ORDER BY pe_store_group, pe_article, date
             LIMIT 100
         """)
     )
 
     print("====================================================")
-    print("base_data_table build completed")
+    print("base_data_table daily build completed")
     print("Base output:", OUTPUT_BASE_TABLE)
     print("Quality output:", OUTPUT_QUALITY_TABLE)
     print("====================================================")
@@ -1151,7 +1249,5 @@ def run_base_data_build():
 # 11. Execute
 # ============================================================
 
-base_df, quality_df = run_base_data_build()
-
 if __name__ == "__main__":
-    run_base_data_build()
+    base_df, quality_df = run_base_data_build()
