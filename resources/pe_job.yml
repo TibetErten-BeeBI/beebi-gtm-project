@@ -1,0 +1,183 @@
+resources:
+  jobs:
+    PE_End_To_End_Pipeline:
+      name: PE_End_To_End_Pipeline
+      tasks:
+        - task_key: check_run_base_data
+          condition_task:
+            op: EQUAL_TO
+            left: "{{job.parameters.run_base_data}}"
+            right: yes
+        - task_key: base_data_build
+          depends_on:
+            - task_key: check_run_base_data
+              outcome: "true"
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/preprocessing/generic_pe_base_data_builder.py
+            parameters:
+              - --input_path
+              - "{{job.parameters.input_path}}"
+              - --input_format
+              - "{{job.parameters.input_format}}"
+              - --excel_sheet
+              - "{{job.parameters.excel_sheet}}"
+              - --output_schema
+              - "{{job.parameters.output_schema}}"
+              - --table_prefix
+              - "{{job.parameters.table_prefix}}"
+              - --create_raw_delta
+              - "{{job.parameters.create_raw_delta}}"
+              - --product_col
+              - "{{job.parameters.product_col}}"
+              - --store_col
+              - "{{job.parameters.store_col}}"
+              - --date_col
+              - "{{job.parameters.date_col}}"
+              - --week_col
+              - "{{job.parameters.week_col}}"
+              - --quantity_col
+              - "{{job.parameters.quantity_col}}"
+              - --price_col
+              - "{{job.parameters.price_col}}"
+              - --base_price_col
+              - "{{job.parameters.base_price_col}}"
+              - --discount_col
+              - "{{job.parameters.discount_col}}"
+              - --category_col
+              - "{{job.parameters.category_col}}"
+              - --product_type_col
+              - "{{job.parameters.product_type_col}}"
+              - --product_division_col
+              - "{{job.parameters.product_division_col}}"
+              - --country_col
+              - "{{job.parameters.country_col}}"
+              - --gender_col
+              - "{{job.parameters.gender_col}}"
+              - --stock_col
+              - "{{job.parameters.stock_col}}"
+              - --inventory_col
+              - "{{job.parameters.inventory_col}}"
+          environment_key: Default
+        - task_key: skip_base_data
+          depends_on:
+            - task_key: check_run_base_data
+              outcome: "false"
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/skip_basedata_trigger.py
+          environment_key: Default
+        - task_key: feature_engineering
+          depends_on:
+            - task_key: skip_base_data
+            - task_key: base_data_build
+          run_if: AT_LEAST_ONE_SUCCESS
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/preprocessing/pe_causal_feature_engineering_dev.py
+            parameters:
+              - --output_schema
+              - "{{job.parameters.output_schema}}"
+              - --table_prefix
+              - "{{job.parameters.table_prefix}}"
+              - --time_grain
+              - "{{job.parameters.time_grain}}"
+          environment_key: Default
+        - task_key: causal_mixed_linear_model
+          depends_on:
+            - task_key: feature_engineering
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/models/causal_model_dev.py
+            parameters:
+              - --output_schema
+              - "{{job.parameters.output_schema}}"
+              - --table_prefix
+              - "{{job.parameters.table_prefix}}"
+              - --time_grain
+              - "{{job.parameters.time_grain}}"
+          environment_key: Default
+        - task_key: predictive_model_arma
+          depends_on:
+            - task_key: causal_mixed_linear_model
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/models/predictive_model_dev.py
+            parameters:
+              - --output_schema
+              - "{{job.parameters.output_schema}}"
+              - --table_prefix
+              - "{{job.parameters.table_prefix}}"
+              - --time_grain
+              - "{{job.parameters.time_grain}}"
+              - --allowed_scenario_discounts
+              - "{{job.parameters.allowed_scenario_discounts}}"
+              - --max_discount
+              - "{{job.parameters.max_discount}}"
+          environment_key: Default
+        - task_key: final_price_elasticity_engine
+          depends_on:
+            - task_key: predictive_model_arma
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/models/price_elasticity_engine.py
+            parameters:
+              - --output_schema
+              - "{{job.parameters.output_schema}}"
+              - --table_prefix
+              - "{{job.parameters.table_prefix}}"
+              - --time_grain
+              - "{{job.parameters.time_grain}}"
+          environment_key: Default
+      queue:
+        enabled: true
+      parameters:
+        - name: allowed_scenario_discounts
+          default: 0,0.05,0.075,0.10,0.15,0.20
+        - name: base_price_col
+          default: base_price
+        - name: category_col
+          default: category
+        - name: country_col
+          default: country
+        - name: create_raw_delta
+          default: auto
+        - name: date_col
+          default: invoice_date
+        - name: discount_col
+          default: discount
+        - name: excel_sheet
+          default: ""
+        - name: gender_col
+          default: gender
+        - name: input_format
+          default: delta
+        - name: input_path
+          default: workspace.default.m5_pe_generic_input_flat
+        - name: inventory_col
+          default: inventory_quantity
+        - name: max_discount
+          default: "0.20"
+        - name: output_schema
+          default: workspace.default
+        - name: price_col
+          default: unit_price
+        - name: product_col
+          default: group_article
+        - name: product_division_col
+          default: product_division
+        - name: product_type_col
+          default: product_type
+        - name: quantity_col
+          default: quantity_sold
+        - name: run_base_data
+          default: yes
+        - name: stock_col
+          default: stock_quantity
+        - name: store_col
+          default: store
+        - name: table_prefix
+          default: m5_pe
+        - name: time_grain
+          default: daily
+        - name: week_col
+          default: week_start_date
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: "5"
+      performance_target: PERFORMANCE_OPTIMIZED

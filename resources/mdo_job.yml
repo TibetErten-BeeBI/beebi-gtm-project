@@ -1,0 +1,66 @@
+resources:
+  jobs:
+    MDO_End_To_End_Pipeline:
+      name: MDO_End_To_End_Pipeline
+      tasks:
+        - task_key: mdo_phase1_engine
+          spark_python_task:
+            python_file: /Workspace/Users/vadali.tejasviram@beebi-consulting.com/PE_work/src/priceelasticity/scripts/mdo/generic_mdo_phase1_engine.py
+            parameters:
+              - --output_schema
+              - "{{job.parameters.output_schema}}"
+              - --table_prefix
+              - "{{job.parameters.table_prefix}}"
+              - --allowed_scenario_discounts
+              - "{{job.parameters.allowed_scenario_discounts}}"
+              - --max_discount
+              - "{{job.parameters.max_discount}}"
+              - --max_abs_elasticity
+              - "{{job.parameters.max_abs_elasticity}}"
+              - --mdo_ready_threshold
+              - "{{job.parameters.mdo_ready_threshold}}"
+              - --mdo_objective
+              - "{{job.parameters.mdo_objective}}"
+              - --min_history_days
+              - "{{job.parameters.min_history_days}}"
+              - --min_price_variation
+              - "{{job.parameters.min_price_variation}}"
+              - --min_discount_variation
+              - "{{job.parameters.min_discount_variation}}"
+              - --min_prediction_confidence
+              - "{{job.parameters.min_prediction_confidence}}"
+              - --min_sales_uplift_pct
+              - "{{job.parameters.min_sales_uplift_pct}}"
+          environment_key: Default
+      queue:
+        enabled: true
+      parameters:
+        - name: output_schema
+          default: workspace.default
+        - name: table_prefix
+          default: m5_pe
+        - name: allowed_scenario_discounts
+          default: 0,0.05,0.075,0.10,0.15,0.20
+        - name: max_discount
+          default: "0.20"
+        - name: max_abs_elasticity
+          default: "11"
+        - name: mdo_ready_threshold
+          default: "0.70"
+        - name: mdo_objective
+          default: revenue
+        - name: min_history_days
+          default: "30"
+        - name: min_price_variation
+          default: "0"
+        - name: min_discount_variation
+          default: "0.01"
+        - name: min_prediction_confidence
+          default: "0.60"
+        - name: min_sales_uplift_pct
+          default: "0"
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: "5"
+      performance_target: PERFORMANCE_OPTIMIZED
